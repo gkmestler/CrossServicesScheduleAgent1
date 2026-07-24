@@ -33,9 +33,26 @@ OUTPUT
 `.trim();
 
 /** The rows, formatted compactly. The Date column time is a weak hint only. */
-function formatRows(rows: RawRow[]): string {
-  return rows
-    .map((row, index) => {
+/**
+ * How many jobs go in one request.
+ *
+ * The build spec called for a single call with all 34 jobs, and that is the
+ * cheaper shape — but measured against the real export it took 49-66 seconds,
+ * either side of the 60-second ceiling a serverless request gets on Vercel's
+ * Hobby plan. Uploads failed with an unexplained timeout.
+ *
+ * Batches of nine run concurrently, so wall-clock is the slowest batch rather
+ * than the sum, which brings a full Saturday comfortably under the limit. A
+ * batch that fails costs only its own rows.
+ */
+const PARSE_BATCH_SIZE = 9;
+
+/** A source row paired with its position in the upload, not in its batch. */
+type IndexedRow = { index: number; row: RawRow };
+
+function formatRows(entries: IndexedRow[]): string {
+  return entries
+    .map(({ index, row }) => {
       const lines = [
         `ROW ${index}`,
         `Customer: ${row.customer ?? [row.firstName, row.lastName].filter(Boolean).join(" ") ?? ""}`,
@@ -160,15 +177,20 @@ export async function parseJobs(
   }
 
   const correctionBlock = formatCorrections(corrections);
-  const userContent = [
-    correctionBlock,
-    `Here are ${rows.length} jobs from this Saturday's export. Parse every one.`,
-    formatRows(rows),
-  ]
-    .filter(Boolean)
-    .join("\n\n");
 
-  try {
+  /**
+   * Ask for one batch. Returns what came back keyed by absolute row index, so
+   * a batch that fails only costs its own rows.
+   */
+  async function parseBatch(entries: IndexedRow[]) {
+    const userContent = [
+      correctionBlock,
+      `Here are ${entries.length} jobs from this Saturday's export. Parse every one.`,
+      formatRows(entries),
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
     const message = await getClaude().messages.parse({
       model: PARSING_MODEL,
       max_tokens: 16000,
@@ -179,87 +201,102 @@ export async function parseJobs(
         effort: "medium",
         format: zodOutputFormat(ParseResponseSchema),
       },
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: userContent }],
+      // The system prompt is identical across batches and weeks; caching it
+      // makes the repeat Saturdays cheaper.
+      system: [{ type: "text" as const, text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" as const } }],
+      messages: [{ role: "user" as const, content: userContent }],
     });
 
-    if (message.stop_reason === "refusal") {
-      return {
-        jobs: fallback(),
-        source: "heuristic",
-        degradedReason: "The parsing request was declined. Fell back to rule-based parsing.",
-      };
-    }
+    if (message.stop_reason === "refusal" || !message.parsed_output) return null;
+    return message.parsed_output.jobs;
+  }
 
-    const parsed = message.parsed_output;
-    if (!parsed) {
-      return {
-        jobs: fallback(),
-        source: "heuristic",
-        degradedReason: "No structured output came back. Fell back to rule-based parsing.",
-      };
-    }
+  const indexed: IndexedRow[] = rows.map((row, index) => ({ index, row }));
+  const batches: IndexedRow[][] = [];
+  for (let i = 0; i < indexed.length; i += PARSE_BATCH_SIZE) {
+    batches.push(indexed.slice(i, i + PARSE_BATCH_SIZE));
+  }
 
+  // Run the batches concurrently. Wall-clock is the slowest batch rather than
+  // the sum, which is what keeps the whole upload inside a serverless timeout.
+  const settled = await Promise.allSettled(batches.map(parseBatch));
+
+  const byIndex = new Map<number, NonNullable<Awaited<ReturnType<typeof parseBatch>>>[number]>();
+  let failedBatches = 0;
+  for (const result of settled) {
+    if (result.status !== "fulfilled" || result.value === null) {
+      failedBatches += 1;
+      continue;
+    }
     // Realign by row_index so a reordered or missing entry can never shift a
     // door code onto the wrong house.
-    const byIndex = new Map<number, (typeof parsed.jobs)[number]>();
-    for (const job of parsed.jobs) byIndex.set(job.row_index, job);
+    for (const job of result.value) byIndex.set(job.row_index, job);
+  }
 
-    const jobs: ParsedJob[] = rows.map((row, index) => {
-      const match = byIndex.get(index);
-      if (!match) {
-        const heuristic = parseRowHeuristically(row);
-        return {
-          ...heuristic,
-          confidence: "low",
-          flags: [
-            ...heuristic.flags,
-            "This job came back missing from the AI parse and was filled in by the rule-based parser.",
-          ],
-        };
-      }
-
-      // Times are schema-constrained, but validate anyway: a bad window would
-      // otherwise reach the optimizer and quietly produce a wrong route.
-      const timesValid =
-        isValidTime(match.window_start) &&
-        isValidTime(match.window_end) &&
-        (match.pinned_time === null || isValidTime(match.pinned_time));
-
-      if (!timesValid) {
-        const heuristic = parseRowHeuristically(row);
-        return {
-          ...heuristic,
-          confidence: "low",
-          flags: [
-            ...heuristic.flags,
-            "The AI returned an unreadable time for this job. Rule-based parsing was used instead.",
-          ],
-        };
-      }
-
-      return {
-        customer: match.customer,
-        address: match.address,
-        job_type: match.job_type,
-        window_start: match.window_start,
-        window_end: match.window_end,
-        pinned_time: match.pinned_time,
-        access: match.access,
-        instructions: match.instructions,
-        confidence: match.confidence,
-        flags: match.flags ?? [],
-      };
-    });
-
-    return { jobs, source: "claude" };
-  } catch (error) {
-    // Never let the access codes in the payload reach a log line.
-    const reason = error instanceof Error ? error.message : "unknown error";
+  if (failedBatches === batches.length) {
     return {
       jobs: fallback(),
       source: "heuristic",
-      degradedReason: `The AI parse failed (${reason}). Fell back to rule-based parsing.`,
+      degradedReason: "The AI parse did not come back. Fell back to rule-based parsing.",
     };
   }
+
+  const corrected = applyCorrections(rows.map(parseRowHeuristically), corrections);
+
+  const jobs: ParsedJob[] = rows.map((row, index) => {
+    const match = byIndex.get(index);
+    if (!match) {
+      const heuristic = corrected[index];
+      return {
+        ...heuristic,
+        confidence: "low",
+        flags: [
+          ...heuristic.flags,
+          "This job did not come back from the AI parse and was filled in by the rule-based parser.",
+        ],
+      };
+    }
+
+    // Times are schema-constrained, but validate anyway: a bad window would
+    // otherwise reach the optimizer and quietly produce a wrong route.
+    const timesValid =
+      isValidTime(match.window_start) &&
+      isValidTime(match.window_end) &&
+      (match.pinned_time === null || isValidTime(match.pinned_time));
+
+    if (!timesValid) {
+      const heuristic = corrected[index];
+      return {
+        ...heuristic,
+        confidence: "low",
+        flags: [
+          ...heuristic.flags,
+          "The AI returned an unreadable time for this job. Rule-based parsing was used instead.",
+        ],
+      };
+    }
+
+    return {
+      customer: match.customer,
+      address: match.address,
+      job_type: match.job_type,
+      window_start: match.window_start,
+      window_end: match.window_end,
+      pinned_time: match.pinned_time,
+      access: match.access,
+      instructions: match.instructions,
+      confidence: match.confidence,
+      flags: match.flags ?? [],
+    };
+  });
+
+  return {
+    jobs,
+    source: "claude",
+    degradedReason:
+      failedBatches > 0
+        ? `${failedBatches} of ${batches.length} batches did not come back; those jobs were parsed by rule instead.`
+        : undefined,
+  };
 }
+

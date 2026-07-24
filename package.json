@@ -27,9 +27,10 @@
     "build": "next build",
     "start": "next start",
     "test": "node --test --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --disable-warning=ExperimentalWarning --import ./tests/register-alias.mjs tests/*.test.ts",
-    "db:push": "drizzle-kit push",
+    "db:push": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/migrate.ts",
     "db:generate": "drizzle-kit generate",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/migrate.ts"
   },
   "engines": {
     "node": "22.x"
