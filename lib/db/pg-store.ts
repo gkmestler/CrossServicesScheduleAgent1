@@ -285,6 +285,13 @@ export class PostgresStore implements Store {
     await getDb().update(t.jobs).set(values).where(eq(t.jobs.id, id));
   }
 
+  async setJobsConfirmed(scheduleId: string, confirmed: boolean): Promise<void> {
+    await getDb()
+      .update(t.jobs)
+      .set({ confirmed })
+      .where(eq(t.jobs.scheduleId, scheduleId));
+  }
+
   /* ------------------------------------------------------------------- Routes */
 
   async listRoutes(scheduleId: string): Promise<Route[]> {

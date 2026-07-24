@@ -192,6 +192,14 @@ export class FileStore implements Store {
     });
   }
 
+  async setJobsConfirmed(scheduleId: string, confirmed: boolean): Promise<void> {
+    await this.mutate((data) => {
+      for (const job of data.jobs) {
+        if (job.scheduleId === scheduleId) job.confirmed = confirmed;
+      }
+    });
+  }
+
   /* ------------------------------------------------------------------- Routes */
 
   async listRoutes(scheduleId: string): Promise<Route[]> {

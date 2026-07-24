@@ -40,6 +40,10 @@ export function ReviewTable({
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
+  const [bulkPending, setBulkPending] = useState(false);
+
+  const reviewedCount = jobs.filter((job) => job.confirmed).length;
+  const allReviewed = jobs.length > 0 && reviewedCount === jobs.length;
 
   // Low confidence first, then medium, then by town so like sits with like.
   const ordered = useMemo(() => {
@@ -94,6 +98,45 @@ export function ReviewTable({
     if (!ok) updateLocal(job.id, { confirmed: !next });
   }
 
+  /**
+   * Most Saturdays parse cleanly, so ticking fifty rows one at a time is the
+   * tax. Mark the lot reviewed here and untick the few that need arguing with.
+   */
+  async function toggleAllConfirmed() {
+    const next = !allReviewed;
+    const previous = jobs;
+
+    setBulkPending(true);
+    setError(null);
+    setJobs((current) => current.map((job) => ({ ...job, confirmed: next })));
+
+    try {
+      const response = await fetch(`/api/schedules/${scheduleId}/jobs`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmed: next }),
+      });
+
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        setJobs(previous);
+        setError(body.error ?? "Those rows could not be saved.");
+        return;
+      }
+
+      setStatus(
+        next
+          ? `All ${previous.length} ${previous.length === 1 ? "job" : "jobs"} marked reviewed. Untick any that still need a look.`
+          : "Cleared. No jobs are marked reviewed.",
+      );
+    } catch {
+      setJobs(previous);
+      setError("Those rows could not be saved — the request did not reach the server.");
+    } finally {
+      setBulkPending(false);
+    }
+  }
+
   return (
     <div className="flex flex-col gap-3">
       {status ? <StatusLine>{status}</StatusLine> : null}
@@ -101,6 +144,27 @@ export function ReviewTable({
         <p role="alert" className="text-[15px] text-warn">
           {error}
         </p>
+      ) : null}
+
+      {/* Select-all sits above the table rather than in the column header: the
+          table scrolls sideways, this line does not. */}
+      {jobs.length > 0 ? (
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <button
+            type="button"
+            disabled={readOnly || bulkPending}
+            onClick={() => void toggleAllConfirmed()}
+            aria-pressed={allReviewed}
+            className="group flex min-h-11 items-center gap-2 text-[17px] text-ink disabled:pointer-events-none disabled:opacity-50"
+          >
+            <CheckMark checked={allReviewed} indeterminate={reviewedCount > 0 && !allReviewed} />
+            {allReviewed ? "Clear all" : "Mark all reviewed"}
+          </button>
+
+          <span className="type-mono text-muted">
+            {reviewedCount} of {jobs.length} reviewed
+          </span>
+        </div>
       ) : null}
 
       <div className="overflow-x-auto rounded-[3px] border border-line bg-surface">
@@ -131,7 +195,7 @@ export function ReviewTable({
                 <td className="px-3 py-3">
                   <button
                     type="button"
-                    disabled={readOnly}
+                    disabled={readOnly || bulkPending}
                     onClick={() => void toggleConfirmed(job)}
                     aria-pressed={job.confirmed}
                     aria-label={`Mark ${job.customer} as reviewed`}

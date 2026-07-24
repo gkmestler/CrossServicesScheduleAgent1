@@ -42,6 +42,8 @@ export interface Store {
   listJobs(scheduleId: string): Promise<Job[]>;
   getJob(id: string): Promise<Job | null>;
   updateJob(id: string, patch: Pick<Partial<Job>, "overrides" | "confirmed">): Promise<void>;
+  /** Marks every job on a schedule reviewed, or clears them all, in one write. */
+  setJobsConfirmed(scheduleId: string, confirmed: boolean): Promise<void>;
 
   /* Routes */
   listRoutes(scheduleId: string): Promise<Route[]>;

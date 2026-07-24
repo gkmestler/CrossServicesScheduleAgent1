@@ -158,20 +158,25 @@ export function MonoTag({
 
 export function CheckMark({
   checked = false,
+  /** Some but not all of the set is checked — draws a dash instead of a tick. */
+  indeterminate = false,
   size = 22,
   className = "",
 }: {
   checked?: boolean;
+  indeterminate?: boolean;
   size?: number;
   className?: string;
 }) {
+  const filled = checked || indeterminate;
+
   return (
     <span
       aria-hidden="true"
       style={{ width: size, height: size }}
       className={[
         "inline-flex shrink-0 items-center justify-center rounded-[2px] border transition-colors duration-200",
-        checked
+        filled
           ? "border-cross-blue bg-cross-blue text-white"
           : "border-line bg-surface text-transparent group-hover:border-cross-blue",
         className,
@@ -187,7 +192,7 @@ export function CheckMark({
         strokeLinecap="round"
         strokeLinejoin="round"
       >
-        <path d="M2 7.5 5.5 11 12 3.5" />
+        {indeterminate && !checked ? <path d="M2.5 7h9" /> : <path d="M2 7.5 5.5 11 12 3.5" />}
       </svg>
     </span>
   );
