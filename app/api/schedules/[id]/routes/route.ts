@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import { failure } from "@/lib/errors";
+
 import { getStore } from "@/lib/db";
 import { buildContext, evaluateRoute } from "@/lib/optimize";
 import { getEffectiveJobs } from "@/lib/schedule";
@@ -25,7 +27,7 @@ type IncomingRoute = {
   movedJobIds?: string[];
 };
 
-export async function PUT(request: Request, { params }: { params: Promise<{ id: string }> }) {
+async function handle(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const unauthorized = await requireApiSession();
   if (unauthorized) return unauthorized;
 
@@ -152,4 +154,20 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
   await store.updateSchedule(id, { totalDriveMinutes, unschedulable });
 
   return NextResponse.json({ ok: true, routes: saved, totalDriveMinutes, unschedulable });
+}
+
+/**
+ * A thrown error would otherwise become an HTML 500 that the client cannot
+ * parse, leaving the scheduler with an unexplained failure. Everything comes
+ * back as JSON with a cause.
+ */
+export async function PUT(
+  request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
+  try {
+    return await handle(request, context);
+  } catch (error) {
+    return failure(error);
+  }
 }

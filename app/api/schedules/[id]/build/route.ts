@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import { failure } from "@/lib/errors";
+
 import { getStore } from "@/lib/db";
 import { buildRoutes } from "@/lib/schedule";
 import { requireApiSession } from "@/lib/session";
@@ -12,7 +14,7 @@ import { requireApiSession } from "@/lib/session";
  */
 export const maxDuration = 60;
 
-export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
+async function handle(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const unauthorized = await requireApiSession();
   if (unauthorized) return unauthorized;
 
@@ -52,4 +54,20 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     suggestionSource: outcome.suggestionSource,
     estimatedLocations: outcome.estimatedLocations,
   });
+}
+
+/**
+ * A thrown error would otherwise become an HTML 500 that the client cannot
+ * parse, leaving the scheduler with an unexplained failure. Everything comes
+ * back as JSON with a cause.
+ */
+export async function POST(
+  request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
+  try {
+    return await handle(request, context);
+  } catch (error) {
+    return failure(error);
+  }
 }

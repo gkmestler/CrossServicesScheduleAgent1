@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import { failure } from "@/lib/errors";
+
 import { getStore } from "@/lib/db";
 import { newId } from "@/lib/db/store";
 import { IngestError, readExport } from "@/lib/ingest";
@@ -18,7 +20,7 @@ export const maxDuration = 60;
 
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
 
-export async function POST(request: Request) {
+async function handle(request: Request) {
   const unauthorized = await requireApiSession();
   if (unauthorized) return unauthorized;
 
@@ -107,4 +109,17 @@ export async function POST(request: Request) {
     parseNote: parse.degradedReason ?? null,
     unrecognizedColumns: ingested.unrecognizedColumns,
   });
+}
+
+/**
+ * A thrown error would otherwise become an HTML 500 that the client cannot
+ * parse, leaving the scheduler with an unexplained failure. Everything comes
+ * back as JSON with a cause.
+ */
+export async function POST(request: Request) {
+  try {
+    return await handle(request);
+  } catch (error) {
+    return failure(error);
+  }
 }

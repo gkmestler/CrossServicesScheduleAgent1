@@ -31,15 +31,29 @@ export function UploadZone() {
     try {
       setStatus("Reading every job's notes for its arrival window, access details and instructions. This takes a moment.");
       const response = await fetch("/api/upload", { method: "POST", body });
-      const payload = (await response.json().catch(() => ({}))) as {
+
+      // A server crash returns an HTML error page, not JSON. Say so rather than
+      // swallowing it — an unexplained "that did not work" is worse than useless.
+      const raw = await response.text();
+      let payload: {
         scheduleId?: string;
         jobCount?: number;
         needsReview?: number;
         error?: string;
-      };
+      } = {};
+      try {
+        payload = JSON.parse(raw) as typeof payload;
+      } catch {
+        payload = {
+          error:
+            response.status === 504
+              ? "The upload timed out on the server. On Vercel's Hobby plan a request is cut off at 60 seconds; a large export may need the Pro plan and maxDuration raised to 300."
+              : `The server returned an error (HTTP ${response.status}) instead of a result. Check the deployment's Runtime Logs for the cause.`,
+        };
+      }
 
       if (!response.ok || !payload.scheduleId) {
-        setError(payload.error ?? "That upload did not work.");
+        setError(payload.error ?? `That upload did not work (HTTP ${response.status}).`);
         setStatus(null);
         setBusy(false);
         return;

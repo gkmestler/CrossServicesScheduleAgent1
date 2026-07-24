@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import { failure } from "@/lib/errors";
+
 import { getStore } from "@/lib/db";
 import { getEffectiveJobs } from "@/lib/schedule";
 import { requireApiSession } from "@/lib/session";
@@ -13,7 +15,7 @@ import type { Override } from "@/lib/types";
  * suggestions; overrides teach the suggestion prompt how he actually schedules;
  * duration learning widens the slot for houses he consistently gives more room.
  */
-export async function POST(_request: Request, { params }: { params: Promise<{ id: string }> }) {
+async function handle(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   const unauthorized = await requireApiSession();
   if (unauthorized) return unauthorized;
 
@@ -100,4 +102,20 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
     overridesRecorded: overrideRows.length,
     durationsLearned: learned.length,
   });
+}
+
+/**
+ * A thrown error would otherwise become an HTML 500 that the client cannot
+ * parse, leaving the scheduler with an unexplained failure. Everything comes
+ * back as JSON with a cause.
+ */
+export async function POST(
+  request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
+  try {
+    return await handle(request, context);
+  } catch (error) {
+    return failure(error);
+  }
 }
