@@ -1,0 +1,231 @@
+@import "tailwindcss";
+
+/* ==========================================================================
+   Cross Services Group — design tokens (see BRAND.md)
+   Sampled from the shipped Cross Services Group site.
+   ========================================================================== */
+
+:root {
+  /* Brand */
+  --cross-blue: #1255a2;
+  --cross-blue-hover: #0f4785;
+  --cross-navy: #0b3665;
+
+  /* Neutrals */
+  --paper: #f7f6f2;
+  --surface: #ffffff;
+  --ink: #1b1d21;
+  --muted: #5c6270;
+  --line: #e4e2db;
+
+  /* The single reserved warning colour. Window violations only, never decorative,
+     and never the sole carrier of meaning — always paired with text and an icon. */
+  --warn: #8a4b1f;
+}
+
+@theme inline {
+  --color-cross-blue: var(--cross-blue);
+  --color-cross-blue-hover: var(--cross-blue-hover);
+  --color-cross-navy: var(--cross-navy);
+  --color-paper: var(--paper);
+  --color-surface: var(--surface);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-warn: var(--warn);
+
+  --font-display: var(--font-newsreader);
+  --font-sans: var(--font-plex-sans);
+  --font-mono: var(--font-plex-mono);
+
+  /* Deliberately near-square. Nothing here is pill-shaped. */
+  --radius-card: 3px;
+  --radius-control: 2px;
+
+  --breakpoint-sm: 640px;
+  --breakpoint-md: 768px;
+  --breakpoint-lg: 1024px;
+  --breakpoint-xl: 1280px;
+}
+
+/* --------------------------------------------------------------------------
+   Base — in @layer base so Tailwind utilities always win over them.
+   -------------------------------------------------------------------------- */
+
+@layer base {
+  * {
+    border-color: var(--line);
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-plex-sans), ui-sans-serif, system-ui, sans-serif;
+    font-size: 17px; /* never below 16px — iOS zooms form inputs under 16px */
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1,
+  h2 {
+    font-family: var(--font-newsreader), ui-serif, Georgia, serif;
+    font-weight: 500;
+    font-optical-sizing: auto;
+    color: var(--cross-navy);
+    text-wrap: balance;
+  }
+
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-weight: 500;
+    color: var(--ink);
+    text-wrap: balance;
+  }
+
+  /* Numeric data lines up in columns everywhere in this app. */
+  table {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Focus — visible on every interactive element. Never removed.
+   -------------------------------------------------------------------------- */
+
+:focus-visible {
+  outline: 2px solid var(--cross-blue);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.on-navy :focus-visible {
+  outline-color: #ffffff;
+}
+
+/* --------------------------------------------------------------------------
+   Utilities
+   -------------------------------------------------------------------------- */
+
+/* The one place all-caps + letter spacing is allowed: mono eyebrows and tags. */
+.type-eyebrow {
+  font-family: var(--font-plex-mono), ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.type-mono {
+  font-family: var(--font-plex-mono), ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+
+.hide-scrollbar {
+  scrollbar-width: none;
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.card-lift {
+  transition:
+    transform 200ms ease-out,
+    box-shadow 200ms ease-out,
+    border-color 200ms ease-out;
+}
+
+@media (hover: hover) {
+  .card-lift:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px -12px rgb(11 54 101 / 0.28);
+  }
+}
+
+/* Empty-state checklist strike. The one place personality is allowed;
+   never used on a working screen. */
+.strike-path {
+  stroke-dasharray: var(--strike-length, 320);
+  stroke-dashoffset: var(--strike-length, 320);
+  animation: strike-draw 520ms cubic-bezier(0.65, 0, 0.35, 1) forwards;
+  animation-delay: var(--strike-delay, 0ms);
+}
+
+@keyframes strike-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* Drag and drop affordances on the board. */
+.drop-target {
+  outline: 2px dashed var(--cross-blue);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--cross-blue) 4%, transparent);
+}
+
+.dragging {
+  opacity: 0.4;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card-lift,
+  .card-lift:hover {
+    transition: none;
+    transform: none;
+  }
+
+  .strike-path {
+    stroke-dashoffset: 0;
+    animation: none;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Print — one team per page for the export view.
+   -------------------------------------------------------------------------- */
+
+@media print {
+  :root {
+    --paper: #ffffff;
+  }
+
+  body {
+    background: #fff;
+    font-size: 12pt;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-page {
+    break-after: page;
+    page-break-after: always;
+    border: none !important;
+    padding: 0 !important;
+  }
+
+  .print-page:last-child {
+    break-after: auto;
+    page-break-after: auto;
+  }
+}
