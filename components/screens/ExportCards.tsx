@@ -24,6 +24,8 @@ export type ExportStop = {
   pinnedTime: string | null;
   access: string | null;
   instructions: string | null;
+  /** Set when this stop is scheduled outside the customer's window. */
+  warning: string | null;
 };
 
 export type ExportRoute = { id: string; team: number; stops: ExportStop[] };
@@ -38,6 +40,9 @@ function asPlainText(route: ExportRoute, date: string): string {
       `   Arrive ${to12Hour(stop.arrival)}, finish ${to12Hour(stop.finish)} (window ${windowLabel(stop.windowStart, stop.windowEnd)})`,
     );
     if (stop.pinnedTime) lines.push(`   TIME LOCK: ${to12Hour(stop.pinnedTime)} — do not move`);
+    // The crew is the last person who can catch this, so it goes in the copied
+    // text too, not just on screen.
+    if (stop.warning) lines.push(`   OUTSIDE WINDOW: ${stop.warning}`);
     if (stop.access) lines.push(`   Access: ${stop.access}`);
     if (stop.instructions) lines.push(`   Notes: ${stop.instructions}`);
     lines.push("");
@@ -154,6 +159,13 @@ export function ExportCards({
 
                     {stop.address ? (
                       <p className="type-mono mt-1 text-muted">{stop.address}</p>
+                    ) : null}
+
+                    {stop.warning ? (
+                      <p className="mt-2 max-w-[68ch] text-[15px] text-warn">
+                        <span className="type-eyebrow mr-2">Outside window</span>
+                        {stop.warning}
+                      </p>
                     ) : null}
 
                     {stop.access ? (

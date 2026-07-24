@@ -274,8 +274,11 @@ export function Board({
           <h1 className="font-display text-[26px] leading-[1.15] font-medium md:text-[34px]">
             {formatDateLong(schedule.date)}
           </h1>
+          {/* Driving is what decides the grouping and the order, but it is not
+              in the arrival times — stops run back to back. Saying so here stops
+              the two numbers looking like they disagree. */}
           <p className="type-mono mt-2 text-muted">
-            {jobs.length} jobs · {formatDuration(totalDrive)} driving
+            {jobs.length} jobs · {formatDuration(totalDrive)} driving, not counted in the times
             {schedule.distanceSource === "haversine" ? " (straight-line estimate)" : ""}
           </p>
         </div>
@@ -355,10 +358,12 @@ export function Board({
           <h2 className="font-display text-[22px] leading-tight font-medium text-cross-navy">
             <WarnIcon /> Not on any team
           </h2>
+          {/* One line about the tray as a whole. Each card carries its own
+              reason underneath — showing one job's reason up here made it look
+              like the explanation for all of them. */}
           <p className="mt-1 max-w-[68ch] text-[15px] text-muted">
-            {schedule.unschedulable.length > 0
-              ? schedule.unschedulable[0].reason
-              : "These jobs are set aside. Drop one onto a team, or use its Move control."}
+            {tray.length === 1 ? "This job is" : `These ${tray.length} jobs are`} not scheduled for
+            anyone. Drop one onto a team, or use its Move control.
           </p>
           <ul className="mt-3 flex flex-wrap gap-2">
             {tray.map((jobId) => {
@@ -398,6 +403,7 @@ export function Board({
       <div className="hide-scrollbar mt-6 flex snap-x snap-mandatory gap-4 overflow-x-auto pb-4 md:snap-none">
         {columns.map((column, index) => {
           const evaluation = evaluations.get(column.routeId);
+          const lateStops = evaluation?.stops.filter((stop) => stop.violation).length ?? 0;
           const isDropTarget = dropTarget === column.routeId;
 
           return (
@@ -436,11 +442,21 @@ export function Board({
                       ))}
                     </Select>
                   </label>
-                  <span className="type-mono text-muted">
+                  <span
+                    className="type-mono text-muted"
+                    title="Driving between these stops. Not included in the arrival times."
+                  >
                     {column.jobIds.length} {column.jobIds.length === 1 ? "stop" : "stops"}
-                    {evaluation ? ` · ${Math.round(evaluation.driveMinutes)} min` : ""}
+                    {evaluation ? ` · ${Math.round(evaluation.driveMinutes)} min driving` : ""}
                   </span>
                 </div>
+
+                {lateStops > 0 ? (
+                  <p className="mt-2 text-[15px] text-warn">
+                    <WarnIcon /> {lateStops} {lateStops === 1 ? "stop runs" : "stops run"} outside
+                    the window.
+                  </p>
+                ) : null}
 
                 {column.rationale ? (
                   <div className="mt-2 flex flex-col gap-1">

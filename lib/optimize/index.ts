@@ -8,6 +8,18 @@
  * browser on every drag without another round trip.
  *
  * Claude is not involved in any of this. Distance arithmetic belongs in code.
+ *
+ * Two deliberate properties of the time model, both chosen by the scheduler:
+ *
+ *  1. Drive time is measured but never added to the clock. It decides who is
+ *     grouped with whom and in what order — that is the whole point of the
+ *     distance matrix — but stops are stacked back to back, on the assumption
+ *     that the 90-minute average already absorbs the hop between houses. So a
+ *     day reads 10:00, 11:30, 1:00 rather than 10:00, 11:33, 1:07.
+ *  2. Nothing is ever refused. A job that will not fit its window is scheduled
+ *     anyway and carries a violation saying so. The scheduler would rather see
+ *     a full day with three stops flagged than a short day and a tray of
+ *     rejects.
  */
 
 export type OptimizerJob = {
@@ -36,15 +48,27 @@ export type EvaluatedStop = {
   jobId: string;
   arrival: number;
   finish: number;
-  /** Minutes driven to reach this stop from the previous one. 0 for the first. */
+  /**
+   * Minutes driven to reach this stop from the previous one, 0 for the first.
+   * Reported, not spent: it is not part of `arrival`.
+   */
   driveMinutes: number;
-  /** Set when this stop finishes after its window closes, or misses a pin. */
+  /** Set when this stop runs past its window close, or misses a time lock. */
   violation: string | null;
 };
 
 export type RouteEvaluation = {
   stops: EvaluatedStop[];
+  /**
+   * Real driving between these stops, in order. Not part of the arrival times —
+   * it is the cost the routing minimizes, and what the board reports separately.
+   */
   driveMinutes: number;
+  /** Minutes past their window close, summed over every stop that runs over. */
+  lateMinutes: number;
+  /** Minutes a time lock is missed by because the stop before it overran. */
+  missedLockMinutes: number;
+  /** True when every stop lands inside its window and every lock is kept. */
   feasible: boolean;
 };
 
@@ -56,6 +80,11 @@ export type OptimizedRoute = {
 
 export type OptimizerResult = {
   routes: OptimizedRoute[];
+  /**
+   * Problems worth the scheduler's attention, by job. Every job is on a route,
+   * so in practice these are stops running outside their window rather than
+   * jobs left behind.
+   */
   unschedulable: { jobId: string; reason: string }[];
   totalDriveMinutes: number;
 };
@@ -92,20 +121,24 @@ function travel(ctx: EvalContext, fromId: string, toId: string): number {
 /**
  * Walks an ordered list of job ids and computes arrival and finish times.
  *
- * A team has no depot — the day starts when they reach their first house. Each
- * subsequent arrival is the later of "when the window opens" and "when they can
- * physically get there". A pinned job is arrived at exactly on its time, waiting
- * if necessary; being unable to reach it by then is the violation.
+ * A team has no depot — the day starts when they reach their first house, at
+ * the moment that window opens. Every stop after it begins when the one before
+ * it finishes: travel is measured and reported, but not spent (see the note at
+ * the top of this file). A pinned job is arrived at exactly on its time,
+ * waiting if necessary.
  *
- * This is also what the board calls client-side on every drop, which is why it
- * reports violations instead of throwing.
+ * Running past a window close is never an error here — it is a violation on
+ * that stop, which the board renders in place and the export sheet prints. This
+ * is also what the board calls client-side on every drop, which is why it
+ * reports rather than throws.
  */
 export function evaluateRoute(order: string[], ctx: EvalContext): RouteEvaluation {
   const stops: EvaluatedStop[] = [];
   let driveTotal = 0;
+  let lateMinutes = 0;
+  let missedLockMinutes = 0;
   let previousFinish: number | null = null;
   let previousId: string | null = null;
-  let feasible = true;
 
   for (const jobId of order) {
     const job = ctx.jobs.get(jobId);
@@ -115,36 +148,52 @@ export function evaluateRoute(order: string[], ctx: EvalContext): RouteEvaluatio
     driveTotal += drive;
 
     const earliest =
-      previousFinish === null ? job.windowStart : Math.max(job.windowStart, previousFinish + drive);
+      previousFinish === null ? job.windowStart : Math.max(job.windowStart, previousFinish);
 
     let arrival: number;
     let violation: string | null = null;
 
     if (job.pinnedTime !== null) {
       arrival = job.pinnedTime;
-      if (earliest > job.pinnedTime) {
-        violation = `Cannot reach this pinned ${formatClock(job.pinnedTime)} job before ${formatClock(earliest)}.`;
+      if (job.pinnedTime < job.windowStart) {
+        lateMinutes += job.windowStart - job.pinnedTime;
+        violation = `Locked at ${formatClock(job.pinnedTime)}, before the ${formatClock(job.windowStart)} window opens.`;
       }
-      if (job.pinnedTime + job.durationMinutes > job.windowEnd) {
-        violation = `Pinned at ${formatClock(job.pinnedTime)}, which finishes after the ${formatClock(job.windowEnd)} window close.`;
+      if (earliest > job.pinnedTime) {
+        missedLockMinutes += earliest - job.pinnedTime;
+        violation = `The stop before this one runs to ${formatClock(earliest)}, past this ${formatClock(job.pinnedTime)} time lock.`;
       }
     } else {
       arrival = earliest;
-      if (arrival + job.durationMinutes > job.windowEnd) {
-        violation = `Finishes at ${formatClock(arrival + job.durationMinutes)}, after the ${formatClock(job.windowEnd)} window close.`;
-      }
     }
 
-    if (violation) feasible = false;
-
     const finish = arrival + job.durationMinutes;
+    if (finish > job.windowEnd) {
+      lateMinutes += finish - job.windowEnd;
+      // The window overrun is the more actionable of the two, so it wins when a
+      // stop has both.
+      violation =
+        job.pinnedTime !== null
+          ? `Locked at ${formatClock(job.pinnedTime)}, so it runs to ${formatClock(finish)} — past the ${formatClock(job.windowEnd)} window close.`
+          : `Runs to ${formatClock(finish)}, past the ${formatClock(job.windowEnd)} window close.`;
+    }
+
     stops.push({ jobId, arrival, finish, driveMinutes: drive, violation });
 
-    previousFinish = finish;
+    // Once jobs stack past their windows a time lock can sit earlier than the
+    // stop before it. The clock must not rewind, or every stop after the lock
+    // would be reported earlier than it can possibly happen.
+    previousFinish = previousFinish === null ? finish : Math.max(finish, previousFinish);
     previousId = jobId;
   }
 
-  return { stops, driveMinutes: driveTotal, feasible };
+  return {
+    stops,
+    driveMinutes: driveTotal,
+    lateMinutes,
+    missedLockMinutes,
+    feasible: lateMinutes === 0 && missedLockMinutes === 0,
+  };
 }
 
 function formatClock(minutes: number): string {
@@ -155,12 +204,29 @@ function formatClock(minutes: number): string {
   return m === 0 ? `${h12}${suffix}` : `${h12}:${String(m).padStart(2, "0")}${suffix}`;
 }
 
-function isFeasible(order: string[], ctx: EvalContext): boolean {
-  return evaluateRoute(order, ctx).feasible;
+/**
+ * What every rearrangement is judged on: how far the team drives, how far past
+ * their windows the stops run, and how badly any time lock is broken.
+ *
+ * A move must lower `drive` without raising either of the other two. Keeping
+ * locks separate from ordinary lateness matters: summed together, a move could
+ * "pay" for breaking a 10am appointment with time saved elsewhere on the day,
+ * and put two 10am locks on one team.
+ */
+type RouteCost = { drive: number; late: number; missedLocks: number };
+
+function measure(order: string[], ctx: EvalContext): RouteCost {
+  const evaluation = evaluateRoute(order, ctx);
+  return {
+    drive: evaluation.driveMinutes,
+    late: evaluation.lateMinutes,
+    missedLocks: evaluation.missedLockMinutes,
+  };
 }
 
-function driveOf(order: string[], ctx: EvalContext): number {
-  return evaluateRoute(order, ctx).driveMinutes;
+/** True when `next` keeps every promise `current` kept, or more of them. */
+function noWorse(next: RouteCost, current: RouteCost): boolean {
+  return next.late <= current.late + 0.01 && next.missedLocks <= current.missedLocks + 0.01;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -229,27 +295,52 @@ function pickSeeds(jobs: OptimizerJob[], ctx: EvalContext, teamCount: number): s
 
 type InsertionCandidate = { routeIndex: number; position: number; cost: number };
 
+/**
+ * Cheapest place to add one job, measured in added drive minutes.
+ *
+ * `allowLate` is what lets the plan hold every job. Left false, this is the
+ * original behaviour: only slots where the whole route still lands inside its
+ * windows are considered, so the jobs that genuinely fit are placed exactly as
+ * they always were. Turned on for the leftovers afterwards, no slot is refused
+ * — geography still picks the spot, and the overrun is reported on the stop.
+ *
+ * Even in overflow, a slot that would knock a time lock off its hour loses to
+ * one that would not. A lock is a commitment to a customer; a window is a
+ * preference.
+ */
 function bestInsertion(
   jobId: string,
   routes: string[][],
   ctx: EvalContext,
   maxJobsPerTeam: number,
+  allowLate = false,
 ): InsertionCandidate | null {
   let best: InsertionCandidate | null = null;
+  let bestLockDelta = Infinity;
 
   for (let r = 0; r < routes.length; r += 1) {
     const route = routes[r];
     if (route.length >= maxJobsPerTeam) continue;
 
-    const baseDrive = driveOf(route, ctx);
+    const base = measure(route, ctx);
 
     for (let position = 0; position <= route.length; position += 1) {
       const candidate = [...route.slice(0, position), jobId, ...route.slice(position)];
       const evaluation = evaluateRoute(candidate, ctx);
-      if (!evaluation.feasible) continue;
+      if (!allowLate && !evaluation.feasible) continue;
 
-      const cost = evaluation.driveMinutes - baseDrive;
-      if (!best || cost < best.cost) best = { routeIndex: r, position, cost };
+      const lockDelta = evaluation.missedLockMinutes - base.missedLocks;
+      const cost = evaluation.driveMinutes - base.drive;
+
+      const better =
+        best === null ||
+        lockDelta < bestLockDelta - 0.01 ||
+        (lockDelta <= bestLockDelta + 0.01 && cost < best.cost);
+
+      if (better) {
+        best = { routeIndex: r, position, cost };
+        bestLockDelta = lockDelta;
+      }
     }
   }
 
@@ -265,7 +356,7 @@ function twoOpt(route: string[], ctx: EvalContext): string[] {
   if (route.length < 4) return route;
 
   let current = route;
-  let currentDrive = driveOf(current, ctx);
+  let cost = measure(current, ctx);
   let improved = true;
 
   while (improved) {
@@ -277,13 +368,12 @@ function twoOpt(route: string[], ctx: EvalContext): string[] {
           ...current.slice(i, k + 1).reverse(),
           ...current.slice(k + 1),
         ];
-        const evaluation = evaluateRoute(candidate, ctx);
-        // Time windows make most reversals infeasible; only keep the ones that
-        // survive both checks.
-        if (!evaluation.feasible) continue;
-        if (evaluation.driveMinutes < currentDrive - 0.01) {
+        const next = measure(candidate, ctx);
+        // Shorter, and no worse on windows or locks. A route with stops already
+        // running over still gets tidied up; it just may not be made any later.
+        if (next.drive < cost.drive - 0.01 && noWorse(next, cost)) {
           current = candidate;
-          currentDrive = evaluation.driveMinutes;
+          cost = next;
           improved = true;
         }
       }
@@ -300,29 +390,43 @@ function relocateBetweenRoutes(
   maxJobsPerTeam: number,
 ): boolean {
   for (let from = 0; from < routes.length; from += 1) {
+    const fromBefore = measure(routes[from], ctx);
+
     for (let stopIndex = 0; stopIndex < routes[from].length; stopIndex += 1) {
       const jobId = routes[from][stopIndex];
       const without = [...routes[from].slice(0, stopIndex), ...routes[from].slice(stopIndex + 1)];
-      if (!isFeasible(without, ctx)) continue;
-
-      const savedHere = driveOf(routes[from], ctx) - driveOf(without, ctx);
+      const fromAfter = measure(without, ctx);
+      const savedHere = fromBefore.drive - fromAfter.drive;
 
       for (let to = 0; to < routes.length; to += 1) {
         if (to === from) continue;
         if (routes[to].length >= maxJobsPerTeam) continue;
 
-        const baseDrive = driveOf(routes[to], ctx);
+        const toBefore = measure(routes[to], ctx);
         for (let position = 0; position <= routes[to].length; position += 1) {
           const candidate = [
             ...routes[to].slice(0, position),
             jobId,
             ...routes[to].slice(position),
           ];
-          const evaluation = evaluateRoute(candidate, ctx);
-          if (!evaluation.feasible) continue;
+          const toAfter = measure(candidate, ctx);
 
-          const addedThere = evaluation.driveMinutes - baseDrive;
-          if (addedThere < savedHere - 0.01) {
+          const addedThere = toAfter.drive - toBefore.drive;
+
+          // Both routes are weighed together: a move must not hand one team's
+          // saved minutes to the other as a broken window or a missed lock.
+          const before = {
+            drive: fromBefore.drive + toBefore.drive,
+            late: fromBefore.late + toBefore.late,
+            missedLocks: fromBefore.missedLocks + toBefore.missedLocks,
+          };
+          const after = {
+            drive: fromAfter.drive + toAfter.drive,
+            late: fromAfter.late + toAfter.late,
+            missedLocks: fromAfter.missedLocks + toAfter.missedLocks,
+          };
+
+          if (addedThere < savedHere - 0.01 && noWorse(after, before)) {
             routes[from] = without;
             routes[to] = candidate;
             return true;
@@ -338,7 +442,13 @@ function relocateBetweenRoutes(
 function swapBetweenRoutes(routes: string[][], ctx: EvalContext): boolean {
   for (let a = 0; a < routes.length; a += 1) {
     for (let b = a + 1; b < routes.length; b += 1) {
-      const baseDrive = driveOf(routes[a], ctx) + driveOf(routes[b], ctx);
+      const beforeA = measure(routes[a], ctx);
+      const beforeB = measure(routes[b], ctx);
+      const before = {
+        drive: beforeA.drive + beforeB.drive,
+        late: beforeA.late + beforeB.late,
+        missedLocks: beforeA.missedLocks + beforeB.missedLocks,
+      };
 
       for (let i = 0; i < routes[a].length; i += 1) {
         for (let j = 0; j < routes[b].length; j += 1) {
@@ -346,11 +456,15 @@ function swapBetweenRoutes(routes: string[][], ctx: EvalContext): boolean {
           const nextB = [...routes[b]];
           [nextA[i], nextB[j]] = [nextB[j], nextA[i]];
 
-          const evalA = evaluateRoute(nextA, ctx);
-          const evalB = evaluateRoute(nextB, ctx);
-          if (!evalA.feasible || !evalB.feasible) continue;
+          const costA = measure(nextA, ctx);
+          const costB = measure(nextB, ctx);
+          const after = {
+            drive: costA.drive + costB.drive,
+            late: costA.late + costB.late,
+            missedLocks: costA.missedLocks + costB.missedLocks,
+          };
 
-          if (evalA.driveMinutes + evalB.driveMinutes < baseDrive - 0.01) {
+          if (after.drive < before.drive - 0.01 && noWorse(after, before)) {
             routes[a] = nextA;
             routes[b] = nextB;
             return true;
@@ -360,6 +474,22 @@ function swapBetweenRoutes(routes: string[][], ctx: EvalContext): boolean {
     }
   }
   return false;
+}
+
+/**
+ * 2-opt within each route, then relocations and swaps between them, until
+ * nothing improves or the budget runs out.
+ */
+function improve(routes: string[][], ctx: EvalContext, maxJobsPerTeam: number): void {
+  const MAX_PASSES = 40;
+  for (let pass = 0; pass < MAX_PASSES; pass += 1) {
+    for (let r = 0; r < routes.length; r += 1) {
+      routes[r] = twoOpt(routes[r], ctx);
+    }
+    const moved = relocateBetweenRoutes(routes, ctx, maxJobsPerTeam);
+    const swapped = moved ? false : swapBetweenRoutes(routes, ctx);
+    if (!moved && !swapped) break;
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -408,6 +538,8 @@ type Attempt = {
   routes: string[][];
   unplaced: { jobId: string; reason: string }[];
   driveMinutes: number;
+  /** Stops scheduled outside their window. The primary thing to minimize. */
+  lateStops: number;
 };
 
 function attempt(
@@ -418,6 +550,8 @@ function attempt(
   compare: (a: OptimizerJob, b: OptimizerJob) => number,
 ): Attempt {
   const unplaced: { jobId: string; reason: string }[] = [];
+  /** Jobs that found no slot inside a window. Placed anyway, once, at the end. */
+  const overflow: OptimizerJob[] = [];
 
   // Step 1 and 2: geographic seeds, one per team, preferring pinned jobs.
   const seedIds = pickSeeds(placeable, ctx, teamCount);
@@ -439,10 +573,7 @@ function attempt(
     if (insertion) {
       routes[insertion.routeIndex].splice(insertion.position, 0, job.id);
     } else {
-      unplaced.push({
-        jobId: job.id,
-        reason: `No team can take this ${formatClock(job.pinnedTime ?? 0)} time lock without pushing another job past its window.`,
-      });
+      overflow.push(job);
     }
   }
 
@@ -466,37 +597,56 @@ function attempt(
       continue;
     }
 
-    unplaced.push({
-      jobId: job.id,
-      reason: `No team can fit this job inside its ${formatClock(job.windowStart)}-${formatClock(job.windowEnd)} window.`,
-    });
+    overflow.push(job);
   }
 
-  // Step 4: improvement. 2-opt within routes, then relocations and swaps
-  // between them, until nothing improves or the budget runs out.
-  const MAX_PASSES = 40;
-  for (let pass = 0; pass < MAX_PASSES; pass += 1) {
-    for (let r = 0; r < routes.length; r += 1) {
-      routes[r] = twoOpt(routes[r], ctx);
-    }
-    const moved = relocateBetweenRoutes(routes, ctx, maxJobsPerTeam);
-    const swapped = moved ? false : swapBetweenRoutes(routes, ctx);
-    if (!moved && !swapped) break;
-  }
+  // Step 4: improvement.
+  improve(routes, ctx, maxJobsPerTeam);
 
-  // With capacity freed up by the improvement pass, retry anything that would
-  // otherwise be reported unschedulable. This routinely rescues the last one or
-  // two jobs of a tight Saturday.
-  for (let i = unplaced.length - 1; i >= 0; i -= 1) {
-    const insertion = bestInsertion(unplaced[i].jobId, routes, ctx, Number.POSITIVE_INFINITY);
+  // With capacity freed up by the improvement pass, retry the leftovers inside
+  // their windows. This routinely rescues the last one or two jobs of a tight
+  // Saturday, and it runs before any of them are stacked over.
+  for (let i = overflow.length - 1; i >= 0; i -= 1) {
+    const insertion = bestInsertion(overflow[i].id, routes, ctx, Number.POSITIVE_INFINITY);
     if (insertion) {
-      routes[insertion.routeIndex].splice(insertion.position, 0, unplaced[i].jobId);
-      unplaced.splice(i, 1);
+      routes[insertion.routeIndex].splice(insertion.position, 0, overflow[i].id);
+      overflow.splice(i, 1);
     }
   }
 
-  const driveMinutes = routes.reduce((sum, route) => sum + driveOf(route, ctx), 0);
-  return { routes, unplaced, driveMinutes };
+  // Step 5: everything still left over goes on a team anyway, stacked past the
+  // window it could not make. The cap does the sharing out, so one team does not
+  // absorb the whole overflow just for being nearest the middle of the Cape.
+  for (const job of overflow) {
+    const insertion =
+      bestInsertion(job.id, routes, ctx, maxJobsPerTeam, true) ??
+      bestInsertion(job.id, routes, ctx, Number.POSITIVE_INFINITY, true);
+
+    if (insertion) {
+      routes[insertion.routeIndex].splice(insertion.position, 0, job.id);
+    } else {
+      // Only reachable with zero teams, which the caller has already ruled out.
+      unplaced.push({
+        jobId: job.id,
+        reason: "There are no teams to put this job on.",
+      });
+    }
+  }
+
+  // A second improvement round, now that the stacked jobs are in — an overfull
+  // day still deserves a sensible order. It can only shorten the driving; the
+  // guard stops it trading a window or a lock for a mile.
+  improve(routes, ctx, maxJobsPerTeam);
+
+  let driveMinutes = 0;
+  let lateStops = 0;
+  for (const route of routes) {
+    const evaluation = evaluateRoute(route, ctx);
+    driveMinutes += evaluation.driveMinutes;
+    lateStops += evaluation.stops.filter((stop) => stop.violation !== null).length;
+  }
+
+  return { routes, unplaced, driveMinutes, lateStops };
 }
 
 export function optimize(input: OptimizerInput): OptimizerResult {
@@ -508,43 +658,24 @@ export function optimize(input: OptimizerInput): OptimizerResult {
     return { routes: [], unschedulable, totalDriveMinutes: 0 };
   }
 
-  // A job whose own duration does not fit its own window can never be placed,
-  // whatever the routing does. Say so plainly rather than squeezing it in.
-  const placeable: OptimizerJob[] = [];
-  for (const job of jobs) {
-    if (job.windowStart + job.durationMinutes > job.windowEnd) {
-      unschedulable.push({
-        jobId: job.id,
-        reason: `The ${Math.round(job.durationMinutes)}-minute clean does not fit inside the ${formatClock(job.windowStart)}-${formatClock(job.windowEnd)} window.`,
-      });
-      continue;
-    }
-    if (
-      job.pinnedTime !== null &&
-      (job.pinnedTime < job.windowStart || job.pinnedTime + job.durationMinutes > job.windowEnd)
-    ) {
-      unschedulable.push({
-        jobId: job.id,
-        reason: `The ${formatClock(job.pinnedTime)} time lock falls outside the ${formatClock(job.windowStart)}-${formatClock(job.windowEnd)} window.`,
-      });
-      continue;
-    }
-    placeable.push(job);
-  }
+  // Every job goes on a team, including one whose own duration cannot fit its
+  // own window — that is a fact about the booking, not something the routing can
+  // fix, and the stop says so where the scheduler will read it.
+  const placeable = jobs;
 
   const maxJobsPerTeam =
     input.maxJobsPerTeam ?? Math.max(1, Math.ceil(placeable.length / teamCount) + 1);
 
-  // Run every ordering and keep the best. Placing every job matters far more
-  // than shaving drive minutes, so that is the primary key.
+  // Run every ordering and keep the best. Since nothing is ever refused now, the
+  // measure of a good day is how few stops end up outside their window; drive
+  // time breaks the tie.
   let best: Attempt | null = null;
   for (const ordering of ORDERINGS) {
     const candidate = attempt(placeable, ctx, teamCount, maxJobsPerTeam, ordering.compare);
     if (
       !best ||
-      candidate.unplaced.length < best.unplaced.length ||
-      (candidate.unplaced.length === best.unplaced.length &&
-        candidate.driveMinutes < best.driveMinutes - 0.01)
+      candidate.lateStops < best.lateStops ||
+      (candidate.lateStops === best.lateStops && candidate.driveMinutes < best.driveMinutes - 0.01)
     ) {
       best = candidate;
     }
@@ -553,8 +684,8 @@ export function optimize(input: OptimizerInput): OptimizerResult {
   const chosen = best!;
   unschedulable.push(...chosen.unplaced);
 
-  // Step 5: validate. Anything still violating its window after all of that is
-  // surfaced rather than silently squeezed in.
+  // Step 6: report. Every stop outside its window is surfaced by name, on the
+  // board and on the printed sheet.
   const built: OptimizedRoute[] = [];
   let totalDriveMinutes = 0;
 

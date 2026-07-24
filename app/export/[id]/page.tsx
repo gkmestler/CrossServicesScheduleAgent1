@@ -16,6 +16,10 @@ export default async function ExportPage({ params }: { params: Promise<{ id: str
   const store = getStore();
   const jobsById = new Map(detail.jobs.map((job) => [job.id, job]));
 
+  // Jobs are never refused a slot, so anything reported here against a stop is
+  // a window the plan could not keep. The crew needs to read it.
+  const warningByJob = new Map(detail.unschedulable.map((item) => [item.jobId, item.reason]));
+
   /**
    * This is the one screen where access codes belong: it is what the scheduler
    * reads while typing the plan into the scheduling app, and what a team would
@@ -39,6 +43,7 @@ export default async function ExportPage({ params }: { params: Promise<{ id: str
           pinnedTime: job?.pinned_time ?? null,
           access: job?.access ?? null,
           instructions: job?.instructions ?? null,
+          warning: warningByJob.get(stop.jobId) ?? null,
         };
       }),
     }));

@@ -110,19 +110,16 @@ test("the fixture is the shape the spec describes", () => {
   assert.equal(jobs.filter((j) => j.town === "Chatham").length > 0, true, "Chatham outliers exist");
 });
 
-test("every job is either placed on a route or reported as unschedulable", () => {
+test("every job is placed on a team, whether or not it fits", () => {
   const jobs = buildJobs();
   const result = optimize({ jobs, matrix: buildMatrix(jobs), teamCount: 8 });
 
   const placed = new Set(result.routes.flatMap((r) => r.stops.map((s) => s.jobId)));
-  const flagged = new Set(result.unschedulable.map((u) => u.jobId));
 
   for (const job of jobs) {
-    assert.ok(
-      placed.has(job.id) || flagged.has(job.id),
-      `${job.id} was neither scheduled nor reported — it vanished`,
-    );
+    assert.ok(placed.has(job.id), `${job.id} was left off the schedule`);
   }
+  assert.equal(placed.size, jobs.length, "a job went missing between input and routes");
 });
 
 test("no job is scheduled twice", () => {
@@ -138,24 +135,94 @@ test("no job is scheduled twice", () => {
   }
 });
 
-test("every scheduled stop finishes inside its window", () => {
+test("a stop is inside its window, or it says out loud that it is not", () => {
   const jobs = buildJobs();
   const byId = new Map(jobs.map((j) => [j.id, j]));
   const result = optimize({ jobs, matrix: buildMatrix(jobs), teamCount: 8 });
 
+  // Overrunning is allowed now — going quiet about it is not. Every stop outside
+  // its window has to carry a reason, and every stop inside one has to be clean,
+  // or the warnings stop meaning anything.
   for (const route of result.routes) {
     for (const stop of route.stops) {
       const job = byId.get(stop.jobId)!;
-      assert.ok(
-        stop.finish <= job.windowEnd,
-        `${job.id} finishes at ${stop.finish} but its window closes at ${job.windowEnd}`,
-      );
-      assert.ok(
-        stop.arrival >= job.windowStart,
-        `${job.id} arrives at ${stop.arrival}, before its window opens at ${job.windowStart}`,
-      );
+      const outside = stop.finish > job.windowEnd || stop.arrival < job.windowStart;
+
+      if (outside) {
+        assert.ok(
+          stop.violation,
+          `${job.id} runs ${stop.arrival}-${stop.finish}, outside its ${job.windowStart}-${job.windowEnd} window, with nothing said about it`,
+        );
+      } else {
+        assert.equal(
+          stop.violation,
+          null,
+          `${job.id} is inside its window but was flagged: ${stop.violation}`,
+        );
+      }
     }
   }
+});
+
+test("travel time is measured but never spent", () => {
+  const jobs = buildJobs();
+  const byId = new Map(jobs.map((j) => [j.id, j]));
+  const result = optimize({ jobs, matrix: buildMatrix(jobs), teamCount: 4 });
+
+  // Four teams guarantees long, stacked routes to check.
+  let consecutive = 0;
+
+  for (const route of result.routes) {
+    assert.ok(route.driveMinutes > 0, "the drive between stops is still reported");
+
+    // The team is free at the latest finish so far, not the previous stop's: a
+    // time lock can sit earlier than the stop before it once a day is stacked.
+    let free: number | null = null;
+
+    for (const stop of route.stops) {
+      const job = byId.get(stop.jobId)!;
+
+      // Back to back, unless the window opens later or a lock holds the slot.
+      if (free !== null && job.pinnedTime === null && job.windowStart <= free) {
+        assert.equal(
+          stop.arrival,
+          free,
+          `${stop.jobId} starts at ${stop.arrival} rather than ${free}, so travel leaked into the clock`,
+        );
+        consecutive += 1;
+      }
+      assert.ok(stop.driveMinutes >= 0, "per-stop drive time is still reported");
+
+      free = free === null ? stop.finish : Math.max(free, stop.finish);
+    }
+  }
+
+  assert.ok(consecutive > 10, "this test needs stacked stops to be checking anything");
+});
+
+test("a job that cannot fit its own window is still scheduled, and flagged", () => {
+  const jobs: OptimizerJob[] = [
+    {
+      id: "impossible",
+      town: "Wellfleet",
+      lat: 41.94,
+      lng: -70.03,
+      // 90 minutes of work inside a two-hour window that a 11:30 lock leaves 60
+      // minutes of. This is the Anne Spencer case from the real Saturday.
+      windowStart: toMinutes("10:30"),
+      windowEnd: toMinutes("12:30"),
+      pinnedTime: toMinutes("11:30"),
+      durationMinutes: 90,
+    },
+  ];
+  const result = optimize({ jobs, matrix: buildMatrix(jobs), teamCount: 2 });
+
+  const stops = result.routes.flatMap((r) => r.stops);
+  assert.equal(stops.length, 1, "the job must still be on a team");
+  assert.equal(stops[0].arrival, toMinutes("11:30"), "the lock is still honoured");
+  assert.match(stops[0].violation ?? "", /window close/i);
+  assert.equal(result.unschedulable.length, 1, "and the schedule reports it once");
+  assert.equal(result.unschedulable[0].jobId, "impossible");
 });
 
 test("pinned jobs land exactly on their locked time", () => {
@@ -175,8 +242,40 @@ test("pinned jobs land exactly on their locked time", () => {
         job.pinnedTime,
         `${job.id} is pinned to ${job.pinnedTime} but was scheduled for ${stop.arrival}`,
       );
-      assert.equal(stop.violation, null, `${job.id} is pinned but its stop reports a violation`);
+      // A lock is always kept. It can still be flagged — a 90-minute clean
+      // locked to 11:30 in a 10:30-12:30 window overruns wherever it goes — but
+      // never for being unreachable, because there is no travel to be late from.
+      assert.doesNotMatch(stop.violation ?? "", /time lock/i, `${job.id}: ${stop.violation}`);
     }
+  }
+});
+
+test("a team is never given two time locks it cannot both keep", () => {
+  const jobs = buildJobs();
+  const matrix = buildMatrix(jobs);
+  const byId = new Map(jobs.map((j) => [j.id, j]));
+
+  // Windows are soft now, so the improvement pass is free to trade one stop
+  // running over for another. Locks are not: shortening the driving by putting
+  // two 10am appointments on one team is a crew in two places at once.
+  for (const teamCount of [4, 6, 8, 10]) {
+    const result = optimize({ jobs, matrix, teamCount });
+
+    for (const route of result.routes) {
+      const lockTimes = route.stops
+        .map((stop) => byId.get(stop.jobId)!)
+        .filter((job) => job.pinnedTime !== null)
+        .map((job) => job.pinnedTime!);
+
+      assert.equal(
+        new Set(lockTimes).size,
+        lockTimes.length,
+        `${teamCount} teams: one team holds two locks at the same time (${lockTimes.join(", ")})`,
+      );
+    }
+
+    const broken = result.unschedulable.filter((u) => /time lock/i.test(u.reason));
+    assert.deepEqual(broken, [], `${teamCount} teams broke a time lock`);
   }
 });
 
@@ -260,7 +359,7 @@ test("no team is given more work than the cap allows", () => {
   }
 });
 
-test("adding teams never leaves more jobs unplaced", () => {
+test("adding teams never puts more stops outside their window", () => {
   const jobs = buildJobs();
   const matrix = buildMatrix(jobs);
 
@@ -269,7 +368,7 @@ test("adding teams never leaves more jobs unplaced", () => {
     const result = optimize({ jobs, matrix, teamCount });
     assert.ok(
       result.unschedulable.length <= previous,
-      `${teamCount} teams left ${result.unschedulable.length} jobs unplaced, worse than the run before it`,
+      `${teamCount} teams left ${result.unschedulable.length} stops outside their window, worse than the run before it`,
     );
     previous = result.unschedulable.length;
   }
@@ -277,30 +376,34 @@ test("adding teams never leaves more jobs unplaced", () => {
 
 test("34 jobs at 90 minutes each genuinely does not fit 8 teams, and it says so", () => {
   // This is a real property of the work, not a shortcoming of the optimizer.
-  // Eight teams working a 9-4 window fit four 90-minute cleans each at the very
-  // best — 32 slots for 34 jobs — and every pinned job that anchors a route at
-  // 10am costs that route a slot. The tool's job is to say so plainly rather
-  // than squeeze someone in and let a team discover it on the day.
+  // Eight teams working a 10-3 window fit three 90-minute cleans each — 24 slots
+  // for 34 jobs. The extra jobs are scheduled anyway, because a team would
+  // rather see a long day than a missing customer, and every stop that runs past
+  // its window says so by name.
   const jobs = buildJobs();
   const matrix = buildMatrix(jobs);
 
   const withEight = optimize({ jobs, matrix, teamCount: 8 });
-  assert.ok(withEight.unschedulable.length > 0, "eight teams should not be enough here");
-  assert.ok(
-    withEight.unschedulable.length <= 6,
-    `eight teams left ${withEight.unschedulable.length} jobs unplaced — the optimizer is leaving capacity on the table`,
-  );
+  const placed = withEight.routes.flatMap((r) => r.stops);
+  assert.equal(placed.length, jobs.length, "every job is on a team even when the day is over full");
+
+  assert.ok(withEight.unschedulable.length > 0, "eight teams cannot do this inside the windows");
   for (const item of withEight.unschedulable) {
     assert.match(
       item.reason,
       /window|time lock/i,
-      "every unplaced job needs a reason the scheduler can act on",
+      "every flagged stop needs a reason the scheduler can act on",
     );
   }
 
-  // Ten teams is enough, which is what the editable team count is for.
+  // Ten teams fits it properly, which is what the editable team count is for.
   const withTen = optimize({ jobs, matrix, teamCount: 10 });
   assert.equal(withTen.unschedulable.length, 0, "ten teams should cover the whole Saturday");
+  assert.equal(
+    withTen.routes.flatMap((r) => r.stops).length,
+    jobs.length,
+    "and still carry every job",
+  );
 });
 
 test("the optimizer is deterministic", () => {
