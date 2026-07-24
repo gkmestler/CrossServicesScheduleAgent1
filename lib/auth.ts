@@ -38,7 +38,34 @@ function safeEqual(a: string, b: string): boolean {
 }
 
 export function isPasswordConfigured(): boolean {
-  return Boolean(process.env.APP_PASSWORD && process.env.SESSION_SECRET);
+  return missingAuthSettings().length === 0;
+}
+
+/**
+ * Which auth settings are missing or unusable, named individually.
+ *
+ * The length check matters: `secret()` throws below 16 characters, so a short
+ * SESSION_SECRET would otherwise pass this gate and then blow up at login with
+ * a 500 instead of the explanatory screen.
+ */
+export function missingAuthSettings(): string[] {
+  const missing: string[] = [];
+  if (!process.env.APP_PASSWORD) missing.push("APP_PASSWORD");
+  if (!process.env.SESSION_SECRET) {
+    missing.push("SESSION_SECRET");
+  } else if (process.env.SESSION_SECRET.length < 16) {
+    missing.push("SESSION_SECRET (it is set, but must be at least 16 characters)");
+  }
+  return missing;
+}
+
+/**
+ * Whether this is a Vercel deployment, so the setup screen can point at the
+ * right place. Telling someone to edit .env.local and restart the dev server is
+ * useless advice on a deployed app.
+ */
+export function isDeployed(): boolean {
+  return Boolean(process.env.VERCEL);
 }
 
 export function checkPassword(candidate: string): boolean {
