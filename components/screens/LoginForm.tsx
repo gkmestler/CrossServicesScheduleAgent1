@@ -4,6 +4,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
 
 import { Button, Field, Input } from "@/components/ui";
+import { safeNext } from "@/lib/auth-constants";
 
 function Form() {
   const router = useRouter();
@@ -30,8 +31,7 @@ function Form() {
       return;
     }
 
-    const next = searchParams.get("next");
-    router.replace(next && next.startsWith("/") ? next : "/");
+    router.replace(safeNext(searchParams.get("next")));
     router.refresh();
   }
 

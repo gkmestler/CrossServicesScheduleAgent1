@@ -1,5 +1,9 @@
+import { redirect } from "next/navigation";
+
 import { isDeployed, isPasswordConfigured, missingAuthSettings } from "@/lib/auth";
+import { safeNext } from "@/lib/auth-constants";
 import { LoginForm } from "@/components/screens/LoginForm";
+import { hasValidSession } from "@/lib/session";
 
 export const metadata = { title: "Sign in | The Furies Scheduler" };
 
@@ -7,7 +11,18 @@ export const metadata = { title: "Sign in | The Furies Scheduler" };
 // deployment that fixes the settings would otherwise keep showing the old page.
 export const dynamic = "force-dynamic";
 
-export default function LoginPage() {
+export default async function LoginPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ next?: string }>;
+}) {
+  // Verified here rather than in middleware, which cannot check the signature.
+  // Someone already signed in has no reason to see this screen; someone holding
+  // a cookie that no longer verifies gets the form, not a redirect loop.
+  if (await hasValidSession()) {
+    redirect(safeNext((await searchParams).next));
+  }
+
   const configured = isPasswordConfigured();
   const missing = missingAuthSettings();
   const deployed = isDeployed();

@@ -13,14 +13,15 @@ import { SESSION_COOKIE } from "@/lib/auth-constants";
  */
 export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
-  const hasCookie = Boolean(request.cookies.get(SESSION_COOKIE)?.value);
 
-  if (pathname === "/login") {
-    if (hasCookie) return NextResponse.redirect(new URL("/", request.url));
-    return NextResponse.next();
-  }
+  // /login always renders. Bouncing a cookie-holder off it from here would loop
+  // forever against a cookie that exists but no longer verifies (an expired
+  // session, or one signed with an older SESSION_SECRET): this would send them
+  // to /, requireSession() would send them back. The login page does that
+  // bounce itself, where the signature can actually be checked.
+  if (pathname === "/login") return NextResponse.next();
 
-  if (!hasCookie) {
+  if (!request.cookies.get(SESSION_COOKIE)?.value) {
     const url = new URL("/login", request.url);
     if (pathname !== "/") url.searchParams.set("next", pathname);
     return NextResponse.redirect(url);
