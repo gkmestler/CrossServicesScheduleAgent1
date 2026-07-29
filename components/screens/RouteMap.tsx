@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { BoardJob } from "@/components/screens/board-types";
-import { Card } from "@/components/ui";
+import { Button, Card } from "@/components/ui";
 
 /**
  * All stops, coloured by route. Pins only — no polylines in v1.
@@ -36,14 +36,21 @@ export function RouteMap({
   apiKey,
   columns,
   estimated,
+  homeBase,
 }: {
   apiKey: string | null;
   columns: MapColumn[];
   estimated: boolean;
+  homeBase: { lat: number; lng: number } | null;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
+  const [selected, setSelected] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (selected !== null && selected >= columns.length) setSelected(null);
+  }, [columns.length, selected]);
 
   useEffect(() => {
     if (!apiKey || !containerRef.current) return;
@@ -76,13 +83,19 @@ export function RouteMap({
       }
 
       const points = columns.flatMap((column, index) =>
-        column.jobs
-          .filter((job) => job.lat !== null && job.lng !== null)
-          .map((job) => ({ job, color: ROUTE_COLORS[index % ROUTE_COLORS.length], label: column.label })),
+        selected !== null && index !== selected
+          ? []
+          : column.jobs
+              .filter((job) => job.lat !== null && job.lng !== null)
+              .map((job) => ({ job, color: ROUTE_COLORS[index % ROUTE_COLORS.length], label: column.label })),
       );
 
       if (points.length === 0) {
-        setError("None of these jobs have coordinates yet.");
+        setError(
+          selected === null
+            ? "None of these jobs have coordinates yet."
+            : "This team has no jobs with coordinates yet.",
+        );
         return;
       }
 
@@ -111,6 +124,26 @@ export function RouteMap({
         });
       }
 
+      if (homeBase) {
+        const position = { lat: homeBase.lat, lng: homeBase.lng };
+        bounds.extend(position);
+        new maps.Marker({
+          map,
+          position,
+          title: "Home base — every team starts and ends the day here",
+          zIndex: 1000,
+          label: { text: "H", color: "#ffffff", fontSize: "11px", fontWeight: "700" },
+          icon: {
+            path: maps.SymbolPath.CIRCLE,
+            scale: 10,
+            fillColor: "#1a1a1a",
+            fillOpacity: 1,
+            strokeColor: "#ffffff",
+            strokeWeight: 2,
+          },
+        });
+      }
+
       map.fitBounds(bounds, 48);
       setReady(true);
     }
@@ -119,7 +152,7 @@ export function RouteMap({
     return () => {
       cancelled = true;
     };
-  }, [apiKey, columns]);
+  }, [apiKey, columns, selected, homeBase]);
 
   if (!apiKey) {
     return (
@@ -136,16 +169,40 @@ export function RouteMap({
   return (
     <Card className="overflow-hidden">
       <div className="flex flex-wrap items-center gap-3 border-b border-line px-4 py-3">
-        {columns.map((column, index) => (
-          <span key={column.label + index} className="type-mono flex items-center gap-1.5 text-muted">
-            <span
-              aria-hidden="true"
-              className="inline-block h-3 w-3 rounded-full"
-              style={{ background: ROUTE_COLORS[index % ROUTE_COLORS.length] }}
-            />
-            {column.label}
+        {columns.map((column, index) => {
+          const isSelected = selected === index;
+          return (
+            <button
+              key={column.label + index}
+              type="button"
+              aria-pressed={isSelected}
+              onClick={() => setSelected((current) => (current === index ? null : index))}
+              className={`type-mono flex items-center gap-1.5 rounded-[2px] px-1.5 py-0.5 ${
+                isSelected ? "bg-ink/8 text-ink" : "text-muted"
+              }`}
+            >
+              <span
+                aria-hidden="true"
+                className="inline-block h-3 w-3 rounded-full"
+                style={{ background: ROUTE_COLORS[index % ROUTE_COLORS.length] }}
+              />
+              {column.label}
+            </button>
+          );
+        })}
+
+        {selected !== null ? (
+          <Button variant="quiet" size="sm" onClick={() => setSelected(null)}>
+            Show all teams
+          </Button>
+        ) : null}
+
+        {homeBase ? (
+          <span className="type-mono ml-auto flex items-center gap-1.5 text-muted">
+            <span aria-hidden="true" className="inline-block h-3 w-3 rounded-full bg-[#1a1a1a]" />
+            Home base
           </span>
-        ))}
+        ) : null}
       </div>
 
       {estimated ? (

@@ -1,5 +1,6 @@
 import { getStore } from "@/lib/db";
 import { distanceMatrix, geocode } from "@/lib/geo";
+import { getHomeBaseCoordinate } from "@/lib/home-base";
 import { defaultDurationFor } from "@/lib/parse/rules";
 import { optimize, type OptimizerJob } from "@/lib/optimize";
 import { suggestTeams, type RouteForSuggestion } from "@/lib/suggest";
@@ -130,15 +131,25 @@ export async function buildRoutes(schedule: Schedule): Promise<BuildOutcome> {
   });
 
   // One matrix per build, cached against the schedule via the persisted stop
-  // times, so drag-and-drop adjustments never re-call the API.
-  const matrix = await distanceMatrix(
-    optimizerJobs.map((job) => ({ lat: job.lat, lng: job.lng })),
+  // times, so drag-and-drop adjustments never re-call the API. The home base
+  // rides along as point 0 so its distance to every job comes back in the same
+  // request, then gets split back out below.
+  const homeBase = await getHomeBaseCoordinate();
+  const fullMatrix = await distanceMatrix([
+    homeBase,
+    ...optimizerJobs.map((job) => ({ lat: job.lat, lng: job.lng })),
+  ]);
+  const jobMinutes = fullMatrix.minutes.slice(1).map((row) => row.slice(1));
+  const depotMinutes = new Map(
+    optimizerJobs.map((job, i) => [job.id, fullMatrix.minutes[0][i + 1]]),
   );
+  const matrix = { minutes: jobMinutes, source: fullMatrix.source };
 
   const result = optimize({
     jobs: optimizerJobs,
     matrix: matrix.minutes,
     teamCount: schedule.teamCount,
+    depotMinutes,
   });
 
   // Team suggestions. Access codes are deliberately absent from this payload.
@@ -205,6 +216,9 @@ export async function buildRoutes(schedule: Schedule): Promise<BuildOutcome> {
     matrix: {
       jobIds: optimizerJobs.map((job) => job.id),
       minutes: matrix.minutes.map((row) => row.map((value) => Math.round(value * 10) / 10)),
+      depotMinutes: optimizerJobs.map(
+        (job) => Math.round((depotMinutes.get(job.id) ?? 0) * 10) / 10,
+      ),
     },
   });
 

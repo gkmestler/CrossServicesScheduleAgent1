@@ -498,3 +498,74 @@ test("evaluateRoute waits at a pinned stop rather than arriving early", () => {
   assert.equal(evaluation.feasible, true);
   assert.equal(evaluation.stops[1].arrival, toMinutes("13:00"), "the team waits for the lock");
 });
+
+test("a home base adds its round trip to the drive total, but never moves an arrival time", () => {
+  const jobs: OptimizerJob[] = [
+    {
+      id: "a",
+      town: "Wellfleet",
+      lat: 41.94,
+      lng: -70.03,
+      windowStart: toMinutes("09:00"),
+      windowEnd: toMinutes("17:00"),
+      pinnedTime: null,
+      durationMinutes: 60,
+    },
+    {
+      id: "b",
+      town: "Wellfleet",
+      lat: 41.95,
+      lng: -70.04,
+      windowStart: toMinutes("09:00"),
+      windowEnd: toMinutes("17:00"),
+      pinnedTime: null,
+      durationMinutes: 60,
+    },
+  ];
+  const matrix = buildMatrix(jobs);
+  const withoutDepot = evaluateRoute(["a", "b"], buildContext(jobs, matrix));
+
+  const homeBase = { lat: 41.9376, lng: -70.0322 };
+  const depotMinutes = new Map(jobs.map((job) => [job.id, haversineMinutes(homeBase, job)]));
+  const withDepot = evaluateRoute(["a", "b"], buildContext(jobs, matrix, depotMinutes));
+
+  assert.deepEqual(
+    withDepot.stops.map((s) => [s.arrival, s.finish]),
+    withoutDepot.stops.map((s) => [s.arrival, s.finish]),
+    "the home base changes what is driven, never when a stop is reached",
+  );
+
+  const roundTrip = depotMinutes.get("a")! + depotMinutes.get("b")!;
+  assert.ok(
+    Math.abs(withDepot.driveMinutes - (withoutDepot.driveMinutes + roundTrip)) < 0.001,
+    "the route total should grow by exactly the trip out and the trip back",
+  );
+});
+
+test("the optimizer finds the true minimum round trip out from and back to the home base", () => {
+  const homeBase = { lat: 41.9, lng: -70.0 };
+  const jobs: OptimizerJob[] = ["near", "mid", "far"].map((id, i) => ({
+    id,
+    town: "Wellfleet",
+    lat: 41.91 + i * 0.01,
+    lng: -70.0,
+    windowStart: toMinutes("09:00"),
+    windowEnd: toMinutes("17:00"),
+    pinnedTime: null,
+    durationMinutes: 30,
+  }));
+  const matrix = buildMatrix(jobs);
+  const depotMinutes = new Map(jobs.map((job) => [job.id, haversineMinutes(homeBase, job)]));
+
+  const result = optimize({ jobs, matrix, teamCount: 1, depotMinutes });
+
+  assert.equal(result.routes.length, 1);
+  // Three stops on a line out from the home base: the cheapest possible round
+  // trip is out to the farthest stop and back — anything that doubles back
+  // past a stop it has already passed costs strictly more.
+  const farDistance = depotMinutes.get("far")!;
+  assert.ok(
+    Math.abs(result.routes[0].driveMinutes - 2 * farDistance) < 0.05,
+    `expected ${2 * farDistance} minutes out-and-back, got ${result.routes[0].driveMinutes}`,
+  );
+});
