@@ -40,7 +40,11 @@ export type OptimizerInput = {
   /** Drive times in minutes, indexed the same as `jobs`. */
   matrix: number[][];
   teamCount: number;
-  /** Defaults to ceil(jobs / teams) + 1. */
+  /**
+   * Overrides the top of the balance band. Left unset, every team is held to
+   * floor(jobs / teams) or ceil(jobs / teams) — the closest an even split can
+   * get. Raising it lets teams differ by more than one job.
+   */
   maxJobsPerTeam?: number;
   /**
    * Minutes from the home base to each job, keyed by job id. When set, every
@@ -414,8 +418,15 @@ function relocateBetweenRoutes(
   routes: string[][],
   ctx: EvalContext,
   maxJobsPerTeam: number,
+  minJobsPerTeam: number,
 ): boolean {
   for (let from = 0; from < routes.length; from += 1) {
+    // A team already down to its share does not give any more away. Without
+    // this the drive-time objective strips small routes bare — and with a home
+    // base it actively wants to, because emptying a route deletes a whole round
+    // trip, which is a bigger saving than any reordering can offer.
+    if (routes[from].length <= minJobsPerTeam) continue;
+
     const fromBefore = measure(routes[from], ctx);
 
     for (let stopIndex = 0; stopIndex < routes[from].length; stopIndex += 1) {
@@ -505,16 +516,140 @@ function swapBetweenRoutes(routes: string[][], ctx: EvalContext): boolean {
 /**
  * 2-opt within each route, then relocations and swaps between them, until
  * nothing improves or the budget runs out.
+ *
+ * Every move here stays inside the balance band: relocation refuses to empty a
+ * team below its share or fill one past it, and a swap is one-for-one. So this
+ * can run after `rebalance` without undoing it.
  */
-function improve(routes: string[][], ctx: EvalContext, maxJobsPerTeam: number): void {
+function improve(
+  routes: string[][],
+  ctx: EvalContext,
+  maxJobsPerTeam: number,
+  minJobsPerTeam: number,
+): void {
   const MAX_PASSES = 40;
   for (let pass = 0; pass < MAX_PASSES; pass += 1) {
     for (let r = 0; r < routes.length; r += 1) {
       routes[r] = twoOpt(routes[r], ctx);
     }
-    const moved = relocateBetweenRoutes(routes, ctx, maxJobsPerTeam);
+    const moved = relocateBetweenRoutes(routes, ctx, maxJobsPerTeam, minJobsPerTeam);
     const swapped = moved ? false : swapBetweenRoutes(routes, ctx);
     if (!moved && !swapped) break;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Balance                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Evens the day out: moves jobs off the fullest teams onto the emptiest until
+ * every team holds between `min` and `max` — which the caller sets one apart, so
+ * this is the closest an even split can get.
+ *
+ * Nothing before this point balances anything. Insertion is greedy on driving
+ * alone, so the cheap routes fill up and a team can finish with one stop while
+ * another has six; the improvement pass then makes it worse rather than better,
+ * because a short route is exactly what it most wants to dissolve.
+ *
+ * Among the moves that even things out it takes the one that keeps the most
+ * promises: never break a time lock to tidy a day, then fewest minutes past a
+ * window, then least driving added. Drive is measured through `measure`, so with
+ * a home base configured a move is costed against the round trip it creates —
+ * not just the hop between two houses.
+ */
+function rebalance(
+  routes: string[][],
+  ctx: EvalContext,
+  minJobsPerTeam: number,
+  maxJobsPerTeam: number,
+): void {
+  // Each pass moves exactly one job and strictly shrinks the distance from the
+  // band, so it cannot need more passes than there are jobs on the board.
+  const limit = routes.reduce((total, route) => total + route.length, 0) + 1;
+
+  for (let pass = 0; pass < limit; pass += 1) {
+    const lengths = routes.map((route) => route.length);
+    const longest = Math.max(...lengths);
+    const shortest = Math.min(...lengths);
+    if (longest <= maxJobsPerTeam && shortest >= minJobsPerTeam) return;
+
+    // Shed from the overfull first; only once nobody is over the top of the band
+    // does topping up the underfull begin. Either way the donor stays at or above
+    // its bound and the receiver stays at or below its own, so a move can never
+    // create the violation it is fixing.
+    const overfull = longest > maxJobsPerTeam;
+    const donors: number[] = [];
+    const receivers: number[] = [];
+    lengths.forEach((length, index) => {
+      if (length > (overfull ? maxJobsPerTeam : minJobsPerTeam)) donors.push(index);
+      if (length < (overfull ? maxJobsPerTeam : minJobsPerTeam)) receivers.push(index);
+    });
+    if (donors.length === 0 || receivers.length === 0) return;
+
+    let best: {
+      from: number;
+      stopIndex: number;
+      to: number;
+      position: number;
+      locks: number;
+      late: number;
+      drive: number;
+    } | null = null;
+
+    for (const from of donors) {
+      const fromBefore = measure(routes[from], ctx);
+
+      for (let stopIndex = 0; stopIndex < routes[from].length; stopIndex += 1) {
+        const jobId = routes[from][stopIndex];
+        const without = [
+          ...routes[from].slice(0, stopIndex),
+          ...routes[from].slice(stopIndex + 1),
+        ];
+        const fromAfter = measure(without, ctx);
+
+        for (const to of receivers) {
+          const toBefore = measure(routes[to], ctx);
+
+          for (let position = 0; position <= routes[to].length; position += 1) {
+            const candidate = [
+              ...routes[to].slice(0, position),
+              jobId,
+              ...routes[to].slice(position),
+            ];
+            const toAfter = measure(candidate, ctx);
+
+            const locks =
+              fromAfter.missedLocks + toAfter.missedLocks -
+              (fromBefore.missedLocks + toBefore.missedLocks);
+            const late = fromAfter.late + toAfter.late - (fromBefore.late + toBefore.late);
+            const drive = fromAfter.drive + toAfter.drive - (fromBefore.drive + toBefore.drive);
+
+            const better =
+              best === null ||
+              locks < best.locks - 0.01 ||
+              (locks <= best.locks + 0.01 &&
+                (late < best.late - 0.01 ||
+                  (late <= best.late + 0.01 && drive < best.drive - 0.01)));
+
+            if (better) best = { from, stopIndex, to, position, locks, late, drive };
+          }
+        }
+      }
+    }
+
+    if (!best) return;
+
+    const jobId = routes[best.from][best.stopIndex];
+    routes[best.from] = [
+      ...routes[best.from].slice(0, best.stopIndex),
+      ...routes[best.from].slice(best.stopIndex + 1),
+    ];
+    routes[best.to] = [
+      ...routes[best.to].slice(0, best.position),
+      jobId,
+      ...routes[best.to].slice(best.position),
+    ];
   }
 }
 
@@ -566,6 +701,8 @@ type Attempt = {
   driveMinutes: number;
   /** Stops scheduled outside their window. The primary thing to minimize. */
   lateStops: number;
+  /** Jobs on the fullest team minus jobs on the emptiest. */
+  spread: number;
 };
 
 function attempt(
@@ -573,6 +710,7 @@ function attempt(
   ctx: EvalContext,
   teamCount: number,
   maxJobsPerTeam: number,
+  minJobsPerTeam: number,
   compare: (a: OptimizerJob, b: OptimizerJob) => number,
 ): Attempt {
   const unplaced: { jobId: string; reason: string }[] = [];
@@ -615,25 +753,21 @@ function attempt(
       continue;
     }
 
-    // Try once more ignoring the per-team cap: a slightly uneven day beats
-    // telling the scheduler a job cannot be done at all.
-    const relaxed = bestInsertion(job.id, routes, ctx, Number.POSITIVE_INFINITY);
-    if (relaxed) {
-      routes[relaxed.routeIndex].splice(relaxed.position, 0, job.id);
-      continue;
-    }
-
+    // No slot inside a window on a team that has room. It waits for the retry
+    // below rather than being forced onto an already-full team: the improvement
+    // pass frequently frees exactly the slot it needs, and handing it to the
+    // fullest team is the move that unbalances the day.
     overflow.push(job);
   }
 
   // Step 4: improvement.
-  improve(routes, ctx, maxJobsPerTeam);
+  improve(routes, ctx, maxJobsPerTeam, minJobsPerTeam);
 
   // With capacity freed up by the improvement pass, retry the leftovers inside
   // their windows. This routinely rescues the last one or two jobs of a tight
   // Saturday, and it runs before any of them are stacked over.
   for (let i = overflow.length - 1; i >= 0; i -= 1) {
-    const insertion = bestInsertion(overflow[i].id, routes, ctx, Number.POSITIVE_INFINITY);
+    const insertion = bestInsertion(overflow[i].id, routes, ctx, maxJobsPerTeam);
     if (insertion) {
       routes[insertion.routeIndex].splice(insertion.position, 0, overflow[i].id);
       overflow.splice(i, 1);
@@ -641,8 +775,10 @@ function attempt(
   }
 
   // Step 5: everything still left over goes on a team anyway, stacked past the
-  // window it could not make. The cap does the sharing out, so one team does not
-  // absorb the whole overflow just for being nearest the middle of the Cape.
+  // window it could not make. Still inside the band — a stop that runs late on
+  // an even day beats handing one team two extra houses. The band always has
+  // room for every job, so the unbounded retry behind it is a safety net that
+  // should not come up.
   for (const job of overflow) {
     const insertion =
       bestInsertion(job.id, routes, ctx, maxJobsPerTeam, true) ??
@@ -662,7 +798,12 @@ function attempt(
   // A second improvement round, now that the stacked jobs are in — an overfull
   // day still deserves a sensible order. It can only shorten the driving; the
   // guard stops it trading a window or a lock for a mile.
-  improve(routes, ctx, maxJobsPerTeam);
+  improve(routes, ctx, maxJobsPerTeam, minJobsPerTeam);
+
+  // Step 6: even the day out, then tidy what that disturbed. The improvement
+  // pass respects the band, so the counts cannot drift back out of it.
+  rebalance(routes, ctx, minJobsPerTeam, maxJobsPerTeam);
+  improve(routes, ctx, maxJobsPerTeam, minJobsPerTeam);
 
   let driveMinutes = 0;
   let lateStops = 0;
@@ -672,7 +813,10 @@ function attempt(
     lateStops += evaluation.stops.filter((stop) => stop.violation !== null).length;
   }
 
-  return { routes, unplaced, driveMinutes, lateStops };
+  const lengths = routes.map((route) => route.length);
+  const spread = Math.max(...lengths) - Math.min(...lengths);
+
+  return { routes, unplaced, driveMinutes, lateStops, spread };
 }
 
 export function optimize(input: OptimizerInput): OptimizerResult {
@@ -689,19 +833,40 @@ export function optimize(input: OptimizerInput): OptimizerResult {
   // fix, and the stop says so where the scheduler will read it.
   const placeable = jobs;
 
-  const maxJobsPerTeam =
-    input.maxJobsPerTeam ?? Math.max(1, Math.ceil(placeable.length / teamCount) + 1);
+  /**
+   * The balance band. `remainder` teams carry one more job than the rest, which
+   * is exactly as even as an integer split gets: 34 jobs over 8 teams is
+   * 5,5,4,4,4,4,4,4 and nothing closer exists.
+   *
+   * Because `teamCount * ceil(jobs / teams) >= jobs`, there is always room for
+   * every job inside the band — so holding to it never costs a job a place, only
+   * sometimes the window it would have preferred.
+   */
+  const share = Math.floor(placeable.length / teamCount);
+  const remainder = placeable.length % teamCount;
+  const maxJobsPerTeam = input.maxJobsPerTeam ?? (remainder > 0 ? share + 1 : share);
+  const minJobsPerTeam = Math.min(share, maxJobsPerTeam);
 
   // Run every ordering and keep the best. Since nothing is ever refused now, the
-  // measure of a good day is how few stops end up outside their window; drive
-  // time breaks the tie.
+  // measure of a good day is how few stops end up outside their window; an even
+  // split comes next, and drive time breaks the tie.
   let best: Attempt | null = null;
   for (const ordering of ORDERINGS) {
-    const candidate = attempt(placeable, ctx, teamCount, maxJobsPerTeam, ordering.compare);
+    const candidate = attempt(
+      placeable,
+      ctx,
+      teamCount,
+      maxJobsPerTeam,
+      minJobsPerTeam,
+      ordering.compare,
+    );
     if (
       !best ||
       candidate.lateStops < best.lateStops ||
-      (candidate.lateStops === best.lateStops && candidate.driveMinutes < best.driveMinutes - 0.01)
+      (candidate.lateStops === best.lateStops &&
+        (candidate.spread < best.spread ||
+          (candidate.spread === best.spread &&
+            candidate.driveMinutes < best.driveMinutes - 0.01)))
     ) {
       best = candidate;
     }

@@ -5,6 +5,7 @@ import { test } from "node:test";
 
 import { estimateCoordinate } from "../lib/geo/gazetteer.ts";
 import { haversineMinutes } from "../lib/geo/index.ts";
+import { HOME_BASE_ADDRESS } from "../lib/home-base.ts";
 import { optimize, evaluateRoute, buildContext, type OptimizerJob } from "../lib/optimize/index.ts";
 import {
   defaultDurationFor,
@@ -568,4 +569,76 @@ test("the optimizer finds the true minimum round trip out from and back to the h
     Math.abs(result.routes[0].driveMinutes - 2 * farDistance) < 0.05,
     `expected ${2 * farDistance} minutes out-and-back, got ${result.routes[0].driveMinutes}`,
   );
+});
+
+/* -------------------------------------------------------------------------- */
+/* Balance                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** The closest an integer split can get: `remainder` teams carry one extra. */
+function idealBand(jobCount: number, teamCount: number): { low: number; high: number } {
+  const low = Math.floor(jobCount / teamCount);
+  return { low, high: jobCount % teamCount > 0 ? low + 1 : low };
+}
+
+test("every team gets the same number of jobs, give or take one", () => {
+  const jobs = buildJobs();
+  const matrix = buildMatrix(jobs);
+  const homeBase = estimateCoordinate(normalizeAddress(HOME_BASE_ADDRESS), "Wellfleet");
+  const depotMinutes = new Map(jobs.map((job) => [job.id, haversineMinutes(homeBase, job)]));
+
+  // Both with and without a home base: the round trip is the thing that most
+  // wants to pile the day onto fewer teams, so it is the case that matters.
+  for (const depot of [undefined, depotMinutes]) {
+    const label = depot ? "with a home base" : "without a home base";
+
+    for (const teamCount of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12]) {
+      const result = optimize({ jobs, matrix, teamCount, depotMinutes: depot });
+      const { low, high } = idealBand(jobs.length, teamCount);
+      const counts = result.routes.map((route) => route.stops.length);
+
+      for (const count of counts) {
+        assert.ok(
+          count >= low && count <= high,
+          `${label}, ${teamCount} teams: a team has ${count} jobs, outside the ${low}–${high} band (${counts.join(",")})`,
+        );
+      }
+    }
+  }
+});
+
+test("no team is sent out empty-handed", () => {
+  const jobs = buildJobs();
+  const matrix = buildMatrix(jobs);
+  const homeBase = estimateCoordinate(normalizeAddress(HOME_BASE_ADDRESS), "Wellfleet");
+  const depotMinutes = new Map(jobs.map((job) => [job.id, haversineMinutes(homeBase, job)]));
+
+  // Emptying a route deletes its whole round trip, which is a larger saving than
+  // any reordering can offer — so before the balance floor existed, asking for
+  // twelve teams with a home base configured quietly returned nine.
+  for (const teamCount of [8, 10, 12]) {
+    const result = optimize({ jobs, matrix, teamCount, depotMinutes });
+    assert.equal(
+      result.routes.length,
+      teamCount,
+      `asked for ${teamCount} teams and got ${result.routes.length} routes`,
+    );
+  }
+});
+
+test("balancing the day does not push stops outside their windows", () => {
+  const jobs = buildJobs();
+  const matrix = buildMatrix(jobs);
+
+  // Evening out the load lowers the busiest team's stop count, and a stop runs
+  // late because the day ahead of it ran long. Balance should never cost windows
+  // — these are the counts the fixture settles at, and they must not grow.
+  const ceiling: Record<number, number> = { 4: 17, 6: 9, 8: 1, 10: 0, 12: 0 };
+  for (const [teams, worst] of Object.entries(ceiling)) {
+    const result = optimize({ jobs, matrix, teamCount: Number(teams) });
+    assert.ok(
+      result.unschedulable.length <= worst,
+      `${teams} teams left ${result.unschedulable.length} stops outside their window, worse than the ${worst} before balancing`,
+    );
+  }
 });
