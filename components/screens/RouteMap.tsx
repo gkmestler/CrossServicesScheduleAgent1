@@ -6,7 +6,8 @@ import type { BoardJob } from "@/components/screens/board-types";
 import { Card } from "@/components/ui";
 
 /**
- * All stops, coloured by route. Pins only — no polylines in v1.
+ * Every stop, coloured by route, numbered in visiting order and joined by a line
+ * that follows the run.
  *
  * Uses a separate browser-restricted key (NEXT_PUBLIC_GOOGLE_MAPS_BROWSER_KEY),
  * distinct from the server key that does geocoding and distances. Without it the
@@ -26,10 +27,63 @@ const ROUTE_COLORS = [
   "#7a6a2f", "#2f6b7a", "#7a2f45", "#4a4a4a", "#2f7a5c",
 ];
 
-declare global {
-  interface Window {
-    google?: typeof globalThis & { maps?: unknown };
-  }
+/* The Maps JS types are not installed, so the API surface is untyped here. */
+/* eslint-disable @typescript-eslint/no-explicit-any */
+type Maps = any;
+
+const LOAD_FAILED =
+  "The map could not load. Check that the browser key is valid and restricted to this domain.";
+
+/** Global hook the Maps loader calls once the API is genuinely usable. */
+const READY_CALLBACK = "__furiesMapsReady";
+
+/**
+ * One shared loader for the page, awaited by every mount.
+ *
+ * Two things made the map need a hide-and-show before it appeared. The script
+ * was considered loaded the moment a `<script data-google-maps>` tag existed in
+ * the DOM, which is long before it has finished fetching — so a second run of
+ * the effect in that window skipped the wait and found nothing. React's
+ * development double-mount makes that second run happen every time. And under
+ * `loading=async`, `script.onload` fires while `google.maps` is still only a
+ * bootstrap stub: the namespace is there but `google.maps.Map` is not a
+ * constructor yet. Toggling the map off and on "fixed" both only because the
+ * real API had finished arriving in the meantime.
+ *
+ * The `callback` parameter is the documented signal for this — it fires when the
+ * legacy namespace is fully populated, so `Map`, `Marker`, `Polyline` and
+ * `SymbolPath` are all safe to use from here on.
+ */
+let loader: Promise<Maps> | null = null;
+
+function loadMaps(apiKey: string): Promise<Maps> {
+  if (loader) return loader;
+
+  const pending = new Promise<Maps>((resolve, reject) => {
+    (window as any)[READY_CALLBACK] = () => {
+      const maps = (window as any).google?.maps;
+      if (maps?.Map) resolve(maps);
+      else reject(new Error("Maps JavaScript API loaded but did not initialise."));
+    };
+
+    const script = document.createElement("script");
+    script.src =
+      "https://maps.googleapis.com/maps/api/js" +
+      `?key=${encodeURIComponent(apiKey)}` +
+      `&loading=async&libraries=marker&callback=${READY_CALLBACK}`;
+    script.async = true;
+    script.onerror = () => reject(new Error("Maps JavaScript API script failed to load."));
+    document.head.appendChild(script);
+  });
+
+  // A rejected load must not stay cached, or every later retry replays the
+  // failure without ever asking the network again.
+  pending.catch(() => {
+    if (loader === pending) loader = null;
+  });
+
+  loader = pending;
+  return pending;
 }
 
 export function RouteMap({
@@ -42,80 +96,121 @@ export function RouteMap({
   estimated: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<Maps>(null);
+  const overlaysRef = useRef<Maps[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    if (!apiKey || !containerRef.current) return;
+    if (!apiKey) return;
 
     let cancelled = false;
 
-    async function load() {
-      // Reuse the script if the map has already been toggled on once.
-      if (!document.querySelector("script[data-google-maps]")) {
-        await new Promise<void>((resolve, reject) => {
-          const script = document.createElement("script");
-          script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey!)}&loading=async&libraries=marker`;
-          script.async = true;
-          script.dataset.googleMaps = "true";
-          script.onload = () => resolve();
-          script.onerror = () => reject(new Error("script failed"));
-          document.head.appendChild(script);
-        }).catch(() => {
-          if (!cancelled) setError("The map could not load. Check that the browser key is valid and restricted to this domain.");
-        });
+    async function draw() {
+      let maps: Maps;
+      try {
+        maps = await loadMaps(apiKey!);
+      } catch {
+        if (!cancelled) setError(LOAD_FAILED);
+        return;
       }
 
       if (cancelled || !containerRef.current) return;
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const maps = (window as any).google?.maps;
-      if (!maps) {
-        setError("The map could not load. Check that the browser key is valid and restricted to this domain.");
-        return;
-      }
-
-      const points = columns.flatMap((column, index) =>
-        column.jobs
-          .filter((job) => job.lat !== null && job.lng !== null)
-          .map((job) => ({ job, color: ROUTE_COLORS[index % ROUTE_COLORS.length], label: column.label })),
-      );
-
-      if (points.length === 0) {
+      const routes = layOut(columns);
+      if (routes.every((route) => route.stops.length === 0)) {
         setError("None of these jobs have coordinates yet.");
         return;
       }
+      setError(null);
 
-      const map = new maps.Map(containerRef.current, {
-        mapTypeControl: false,
-        streetViewControl: false,
-        fullscreenControl: false,
-      });
+      // Created once and kept. Rebuilding the map on every prop change threw
+      // away whatever the user had panned or zoomed to.
+      const isFirstDraw = mapRef.current === null;
+      if (isFirstDraw) {
+        mapRef.current = new maps.Map(containerRef.current, {
+          mapTypeControl: false,
+          streetViewControl: false,
+          fullscreenControl: false,
+          // Without this fitBounds snaps down to a whole zoom level, which on a
+          // day's worth of stops in one town can leave the run as a knot of
+          // overlapping pins in the middle of half the state.
+          isFractionalZoomEnabled: true,
+        });
+      }
+      const map = mapRef.current;
+
+      for (const overlay of overlaysRef.current) overlay.setMap(null);
+      overlaysRef.current = [];
 
       const bounds = new maps.LatLngBounds();
-      for (const point of points) {
-        const position = { lat: point.job.lat!, lng: point.job.lng! };
-        bounds.extend(position);
-        new maps.Marker({
-          map,
-          position,
-          title: `${point.label} — ${point.job.customer} (${point.job.town})`,
-          icon: {
-            path: maps.SymbolPath.CIRCLE,
-            scale: 8,
-            fillColor: point.color,
-            fillOpacity: 1,
-            strokeColor: "#ffffff",
-            strokeWeight: 2,
-          },
+
+      for (const route of routes) {
+        if (route.stops.length === 0) continue;
+
+        // The run itself, drawn under the pins. Arrows carry the direction, so
+        // stop 1 to stop 2 is readable without counting the numbers.
+        if (route.stops.length > 1) {
+          overlaysRef.current.push(
+            new maps.Polyline({
+              map,
+              path: route.stops.map((stop) => stop.position),
+              strokeColor: route.color,
+              strokeOpacity: 0.7,
+              strokeWeight: 3,
+              icons: [
+                {
+                  icon: {
+                    path: maps.SymbolPath.FORWARD_CLOSED_ARROW,
+                    scale: 2.6,
+                    strokeColor: route.color,
+                    strokeOpacity: 1,
+                    fillColor: route.color,
+                    fillOpacity: 1,
+                  },
+                  offset: "50%",
+                  repeat: "140px",
+                },
+              ],
+            }),
+          );
+        }
+
+        route.stops.forEach((stop, index) => {
+          bounds.extend(stop.position);
+          const number = String(index + 1);
+          overlaysRef.current.push(
+            new maps.Marker({
+              map,
+              position: stop.position,
+              zIndex: 10,
+              title: `${route.label} · stop ${number} — ${stop.job.customer} (${stop.job.town})`,
+              label: {
+                text: number,
+                color: "#ffffff",
+                fontSize: number.length > 1 ? "10px" : "11px",
+                fontWeight: "600",
+              },
+              icon: {
+                path: maps.SymbolPath.CIRCLE,
+                scale: 11,
+                fillColor: route.color,
+                fillOpacity: 1,
+                strokeColor: "#ffffff",
+                strokeWeight: 2,
+              },
+            }),
+          );
         });
       }
 
-      map.fitBounds(bounds, 48);
+      // Only on the first draw: refitting after a drag would yank the viewport
+      // out from under someone who had zoomed into one corner of the map.
+      if (isFirstDraw) map.fitBounds(bounds, 48);
       setReady(true);
     }
 
-    void load();
+    void draw();
     return () => {
       cancelled = true;
     };
@@ -146,6 +241,7 @@ export function RouteMap({
             {column.label}
           </span>
         ))}
+        <span className="type-mono ml-auto text-muted">Numbered in visiting order</span>
       </div>
 
       {estimated ? (
@@ -166,4 +262,48 @@ export function RouteMap({
       ) : null}
     </Card>
   );
+}
+
+type PlacedStop = { job: BoardJob; position: { lat: number; lng: number } };
+type PlacedRoute = { label: string; color: string; stops: PlacedStop[] };
+
+/**
+ * Turns the columns into drawable routes, keeping each column's order — that
+ * order is the run, so it is also the numbering and the shape of the line.
+ *
+ * Stops that share a coordinate get nudged apart. Two jobs at one condo complex
+ * — or every job in a town, when coordinates are town-centre estimates — would
+ * otherwise stack into a single dot with one number legible out of five. The
+ * offset is a few metres on a golden-angle spiral, small enough that the pin is
+ * still on the right building and stable enough that a redraw does not shuffle
+ * them.
+ */
+function layOut(columns: MapColumn[]): PlacedRoute[] {
+  const seen = new Map<string, number>();
+
+  return columns.map((column, index) => ({
+    label: column.label,
+    color: ROUTE_COLORS[index % ROUTE_COLORS.length],
+    stops: column.jobs
+      .filter((job) => job.lat !== null && job.lng !== null)
+      .map((job) => {
+        const lat = job.lat!;
+        const lng = job.lng!;
+        const key = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+        const nth = seen.get(key) ?? 0;
+        seen.set(key, nth + 1);
+
+        if (nth === 0) return { job, position: { lat, lng } };
+
+        const angle = nth * 2.399963; // golden angle, so rings fill evenly
+        const radius = 0.00028 * Math.sqrt(nth + 1);
+        return {
+          job,
+          position: {
+            lat: lat + radius * Math.sin(angle),
+            lng: lng + (radius * Math.cos(angle)) / Math.cos((lat * Math.PI) / 180),
+          },
+        };
+      }),
+  }));
 }
