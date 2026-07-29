@@ -1,11 +1,9 @@
-import Link from "next/link";
-
 import { Header } from "@/components/layout/Header";
+import { ScheduleList } from "@/components/screens/ScheduleList";
 import { UploadZone } from "@/components/screens/UploadZone";
-import { Card, Tag } from "@/components/ui";
+import { Card } from "@/components/ui";
 import { getStore } from "@/lib/db";
 import { requireSession } from "@/lib/session";
-import { formatDateLong } from "@/lib/time";
 
 export default async function UploadPage() {
   await requireSession();
@@ -39,31 +37,15 @@ export default async function UploadPage() {
           {schedules.length === 0 ? (
             <EmptyState />
           ) : (
-            <ul className="mt-5 flex flex-col gap-2">
-              {schedules.map((schedule) => (
-                <Card as="li" key={schedule.id} className="card-lift">
-                  <Link
-                    href={schedule.status === "final" ? `/export/${schedule.id}` : `/review/${schedule.id}`}
-                    className="flex flex-wrap items-center justify-between gap-3 px-4 py-4"
-                  >
-                    <div className="flex flex-col gap-1">
-                      <span className="text-[17px] font-medium text-ink">
-                        {formatDateLong(schedule.date)}
-                      </span>
-                      <span className="type-mono text-muted">
-                        {schedule.teamCount} teams
-                        {schedule.totalDriveMinutes !== null
-                          ? ` · ${Math.round(schedule.totalDriveMinutes)} min driving`
-                          : " · not routed yet"}
-                      </span>
-                    </div>
-                    <Tag tone={schedule.status === "final" ? "blue" : "default"}>
-                      {schedule.status === "final" ? "Finalized" : "Draft"}
-                    </Tag>
-                  </Link>
-                </Card>
-              ))}
-            </ul>
+            <ScheduleList
+              schedules={schedules.map((schedule) => ({
+                id: schedule.id,
+                date: schedule.date,
+                status: schedule.status,
+                teamCount: schedule.teamCount,
+                totalDriveMinutes: schedule.totalDriveMinutes,
+              }))}
+            />
           )}
         </section>
       </main>

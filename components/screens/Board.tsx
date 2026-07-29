@@ -32,9 +32,9 @@ const TRAY = "__tray__";
 
 export function Board({
   scheduleId,
-  schedule,
+  schedule: initialSchedule,
   jobs,
-  routes,
+  routes: initialRoutes,
   browserMapKey,
 }: {
   scheduleId: string;
@@ -45,27 +45,20 @@ export function Board({
 }) {
   const jobsById = useMemo(() => new Map(jobs.map((job) => [job.id, job])), [jobs]);
 
-  const [columns, setColumns] = useState<Column[]>(() =>
-    routes.map((route) => ({
-      routeId: route.id,
-      finalTeam: route.finalTeam,
-      suggestedTeam: route.suggestedTeam,
-      rationale: route.suggestionRationale,
-      jobIds: route.stops.map((stop) => stop.jobId),
-    })),
-  );
-
-  const [tray, setTray] = useState<string[]>(() => {
-    const placed = new Set(routes.flatMap((r) => r.stops.map((s) => s.jobId)));
-    return jobs.filter((job) => !placed.has(job.id)).map((job) => job.id);
-  });
+  /**
+   * The schedule is state, not just a prop, because rebuilding the routes and
+   * unfinalizing both change it without leaving the page.
+   */
+  const [schedule, setSchedule] = useState<Schedule>(initialSchedule);
+  const [columns, setColumns] = useState<Column[]>(() => toColumns(initialRoutes));
+  const [tray, setTray] = useState<string[]>(() => toTray(initialRoutes, jobs));
 
   const [movedJobIds, setMovedJobIds] = useState<Set<string>>(new Set());
   const [teamCount, setTeamCount] = useState(schedule.teamCount);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [showMap, setShowMap] = useState(false);
+  const [showMap, setShowMap] = useState(true);
   const [dragging, setDragging] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
 
@@ -103,6 +96,22 @@ export function Board({
   const violationCount = useMemo(
     () => [...evaluations.values()].reduce((n, e) => n + e.stops.filter((s) => s.violation).length, 0),
     [evaluations],
+  );
+
+  /**
+   * Memoized because the map redraws whenever this changes identity. Built
+   * inline in the JSX it was a new array on every render, so every keystroke
+   * elsewhere on the board tore down and rebuilt every pin and line.
+   */
+  const mapColumns = useMemo(
+    () =>
+      columns.map((column, index) => ({
+        label: labelFor(column, index),
+        jobs: column.jobIds
+          .map((id) => jobsById.get(id))
+          .filter((job): job is BoardJob => job !== undefined),
+      })),
+    [columns, jobsById],
   );
 
   /* ------------------------------------------------------------------ saving */
@@ -204,20 +213,61 @@ export function Board({
     setBusy(true);
     setError(null);
     setStatus("Rebuilding the routes…");
+
+    // A queued autosave holds the routes that are about to be replaced. Letting
+    // it fire after the rebuild would write the old grouping back over the new.
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+
     const response = await fetch(`/api/schedules/${scheduleId}/build`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ teamCount: nextTeamCount }),
     });
-    if (!response.ok) {
-      const body = (await response.json().catch(() => ({}))) as { error?: string };
+    const body = (await response.json().catch(() => ({}))) as {
+      error?: string;
+      schedule?: Schedule;
+      routes?: Route[];
+    };
+
+    if (!response.ok || !body.schedule || !body.routes) {
       setError(body.error ?? "The rebuild did not work.");
       setBusy(false);
       setStatus(null);
       return;
     }
-    // A rebuild replaces routes, stop times and the cached matrix wholesale.
-    window.location.reload();
+
+    // A rebuild replaces routes, stop times and the cached matrix wholesale, so
+    // the board takes the whole new plan from the response. This used to reload
+    // the page instead, which meant the map only caught up on a manual refresh.
+    setSchedule(body.schedule);
+    setColumns(toColumns(body.routes));
+    setTray(toTray(body.routes, jobs));
+    setMovedJobIds(new Set());
+    setTeamCount(body.schedule.teamCount);
+    setBusy(false);
+    setStatus(
+      `Rebuilt into ${body.routes.length} ${body.routes.length === 1 ? "route" : "routes"}.`,
+    );
+  }
+
+  /** Reopens a finalized schedule for editing. */
+  async function unfinalize() {
+    setBusy(true);
+    setError(null);
+    setStatus("Reopening this schedule…");
+
+    const response = await fetch(`/api/schedules/${scheduleId}/finalize`, { method: "DELETE" });
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      setError(body.error ?? "This schedule could not be reopened.");
+      setBusy(false);
+      setStatus(null);
+      return;
+    }
+
+    setSchedule((current) => ({ ...current, status: "draft", finalizedAt: null }));
+    setBusy(false);
+    setStatus("Back to draft. Finalize again once the changes are in.");
   }
 
   async function finalize() {
@@ -254,7 +304,9 @@ export function Board({
 
   /* ------------------------------------------------------------- not built yet */
 
-  if (routes.length === 0) {
+  // Reads from state, not the prop, so the first build swaps the prompt for the
+  // board in place rather than waiting for a reload.
+  if (columns.length === 0) {
     return (
       <BuildPrompt
         date={schedule.date}
@@ -317,7 +369,12 @@ export function Board({
               Finalize schedule
             </Button>
           ) : (
-            <Tag tone="solid">Finalized</Tag>
+            <>
+              <Tag tone="solid">Finalized</Tag>
+              <Button variant="quiet" size="sm" disabled={busy} onClick={() => void unfinalize()}>
+                Unfinalize
+              </Button>
+            </>
           )}
         </div>
       </div>
@@ -341,12 +398,7 @@ export function Board({
         <div className="mt-6">
           <RouteMap
             apiKey={browserMapKey}
-            columns={columns.map((column, index) => ({
-              label: labelFor(column, index),
-              jobs: column.jobIds
-                .map((id) => jobsById.get(id))
-                .filter((job): job is BoardJob => job !== undefined),
-            }))}
+            columns={mapColumns}
             estimated={schedule.distanceSource === "haversine"}
           />
         </div>
@@ -588,6 +640,23 @@ export function Board({
 
 function labelFor(column: Column, index: number): string {
   return column.finalTeam !== null ? `Team ${column.finalTeam}` : `Route ${index + 1}`;
+}
+
+/** Server routes to board columns. Used for the initial load and every rebuild. */
+function toColumns(routes: Route[]): Column[] {
+  return routes.map((route) => ({
+    routeId: route.id,
+    finalTeam: route.finalTeam,
+    suggestedTeam: route.suggestedTeam,
+    rationale: route.suggestionRationale,
+    jobIds: route.stops.map((stop) => stop.jobId),
+  }));
+}
+
+/** Whatever the optimizer could not place. Recomputed alongside the columns. */
+function toTray(routes: Route[], jobs: BoardJob[]): string[] {
+  const placed = new Set(routes.flatMap((route) => route.stops.map((stop) => stop.jobId)));
+  return jobs.filter((job) => !placed.has(job.id)).map((job) => job.id);
 }
 
 /** Street line only — the town is shown next to it. */

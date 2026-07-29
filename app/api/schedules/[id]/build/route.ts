@@ -45,8 +45,16 @@ async function handle(request: Request, { params }: { params: Promise<{ id: stri
 
   const outcome = await buildRoutes({ ...schedule, teamCount });
 
+  // The new plan comes back in full — routes, and the schedule row as it now
+  // stands with its fresh drive-time matrix. The board applies both to what is
+  // already on screen instead of reloading the page, which is what used to
+  // leave the map drawing the previous grouping until a manual refresh.
+  const rebuilt = await store.getSchedule(id);
+
   return NextResponse.json({
     ok: true,
+    schedule: rebuilt,
+    routes: outcome.routes,
     routeCount: outcome.routes.length,
     totalDriveMinutes: outcome.totalDriveMinutes,
     unschedulable: outcome.unschedulable,

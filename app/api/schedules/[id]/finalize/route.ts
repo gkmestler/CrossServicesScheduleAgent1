@@ -105,6 +105,36 @@ async function handle(_request: Request, { params }: { params: Promise<{ id: str
 }
 
 /**
+ * Unfinalize: put a shipped Saturday back into draft so it can be edited again.
+ *
+ * This also drops the assignments and overrides that finalizing recorded.
+ * Without that, reopening a schedule and finalizing it again would leave the
+ * abandoned version still teaching next week's team suggestions — and the
+ * override notes, which are appended rather than replaced, would accumulate a
+ * copy per attempt.
+ *
+ * One thing does not come back: durations learned into `houses` above. Those
+ * overwrote the previous estimate, the old value is gone, and the next finalize
+ * writes them again from whatever the plan ends up being.
+ */
+async function reopen(_request: Request, { params }: { params: Promise<{ id: string }> }) {
+  const unauthorized = await requireApiSession();
+  if (unauthorized) return unauthorized;
+
+  const { id } = await params;
+  const store = getStore();
+  const schedule = await store.getSchedule(id);
+  if (!schedule) {
+    return NextResponse.json({ error: "That schedule no longer exists." }, { status: 404 });
+  }
+
+  await store.clearScheduleHistory(id);
+  await store.updateSchedule(id, { status: "draft", finalizedAt: null });
+
+  return NextResponse.json({ ok: true });
+}
+
+/**
  * A thrown error would otherwise become an HTML 500 that the client cannot
  * parse, leaving the scheduler with an unexplained failure. Everything comes
  * back as JSON with a cause.
@@ -115,6 +145,17 @@ export async function POST(
 ) {
   try {
     return await handle(request, context);
+  } catch (error) {
+    return failure(error);
+  }
+}
+
+export async function DELETE(
+  request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
+  try {
+    return await reopen(request, context);
   } catch (error) {
     return failure(error);
   }

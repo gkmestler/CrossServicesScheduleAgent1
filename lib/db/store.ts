@@ -25,6 +25,13 @@ export interface Store {
   getSchedule(id: string): Promise<Schedule | null>;
   createSchedule(input: Omit<Schedule, "id" | "createdAt">): Promise<Schedule>;
   updateSchedule(id: string, patch: Partial<Schedule>): Promise<void>;
+  /**
+   * Removes a schedule and everything that belongs only to it — its jobs,
+   * routes, stops, and the history its finalize recorded. Houses, customers and
+   * per-customer corrections survive: they are shared across Saturdays, and
+   * deleting one week's upload should not forget an address or a door code.
+   */
+  deleteSchedule(id: string): Promise<void>;
 
   /* Houses and customers */
   getOrCreateHouse(input: {
@@ -57,6 +64,14 @@ export interface Store {
   assignmentsForHouses(houseIds: string[]): Promise<Assignment[]>;
   recordOverrides(rows: Omit<Override, "id" | "createdAt">[]): Promise<void>;
   recentOverrides(limit: number): Promise<Override[]>;
+  /**
+   * Drops the assignments and overrides a finalize wrote for one schedule.
+   *
+   * Unfinalizing calls this so that reopening a Saturday, changing it and
+   * finalizing again leaves one set of history rather than two overlapping ones
+   * teaching next week's suggestions from a plan that was never shipped.
+   */
+  clearScheduleHistory(scheduleId: string): Promise<void>;
 }
 
 /** Short, sortable, collision-resistant enough for a single-user tool. */

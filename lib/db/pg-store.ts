@@ -129,6 +129,13 @@ export class PostgresStore implements Store {
     await getDb().update(t.schedules).set(values).where(eq(t.schedules.id, id));
   }
 
+  async deleteSchedule(id: string): Promise<void> {
+    // jobs, routes, assignments and overrides all declare onDelete: "cascade"
+    // against schedules, and route_stops cascades from routes, so this one
+    // statement takes the whole tree with it.
+    await getDb().delete(t.schedules).where(eq(t.schedules.id, id));
+  }
+
   /* ------------------------------------------------------ Houses and customers */
 
   async getOrCreateHouse(input: {
@@ -477,6 +484,14 @@ export class PostgresStore implements Store {
     await getDb()
       .insert(t.overrides)
       .values(rows.map((row) => ({ ...row, id: newId("ovr") })));
+  }
+
+  async clearScheduleHistory(scheduleId: string): Promise<void> {
+    const database = getDb();
+    await database.transaction(async (tx) => {
+      await tx.delete(t.assignments).where(eq(t.assignments.scheduleId, scheduleId));
+      await tx.delete(t.overrides).where(eq(t.overrides.scheduleId, scheduleId));
+    });
   }
 
   async recentOverrides(limit: number): Promise<Override[]> {

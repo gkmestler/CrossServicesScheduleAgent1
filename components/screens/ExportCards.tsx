@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 import { Button, ButtonLink, Card, MonoTag, Tag } from "@/components/ui";
@@ -62,7 +63,30 @@ export function ExportCards({
   status: "draft" | "final";
   routes: ExportRoute[];
 }) {
+  const router = useRouter();
   const [copied, setCopied] = useState<string | null>(null);
+  const [reopening, setReopening] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  /**
+   * Finalizing lands here, so this is where someone realises the plan needs one
+   * more change. Reopening from this screen saves a trip back to the board to
+   * find the same control.
+   */
+  async function unfinalize() {
+    setReopening(true);
+    setError(null);
+
+    const response = await fetch(`/api/schedules/${scheduleId}/finalize`, { method: "DELETE" });
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      setError(body.error ?? "This schedule could not be reopened.");
+      setReopening(false);
+      return;
+    }
+
+    router.push(`/board/${scheduleId}`);
+  }
 
   async function copy(route: ExportRoute) {
     const text = asPlainText(route, date);
@@ -100,6 +124,11 @@ export function ExportCards({
 
         <div className="flex flex-wrap items-center gap-2">
           {status === "final" ? <Tag tone="solid">Finalized</Tag> : <Tag>Draft</Tag>}
+          {status === "final" ? (
+            <Button variant="quiet" size="sm" disabled={reopening} onClick={() => void unfinalize()}>
+              {reopening ? "Reopening…" : "Unfinalize"}
+            </Button>
+          ) : null}
           <ButtonLink href={`/board/${scheduleId}`} variant="secondary" size="sm">
             Back to the board
           </ButtonLink>
@@ -108,6 +137,12 @@ export function ExportCards({
           </Button>
         </div>
       </div>
+
+      {error ? (
+        <p role="alert" className="mt-3 text-[15px] text-warn no-print">
+          {error}
+        </p>
+      ) : null}
 
       <p className="mt-4 max-w-[68ch] text-[15px] text-muted no-print">
         Access codes are shown here because this is the sheet you work from. Printing puts one team

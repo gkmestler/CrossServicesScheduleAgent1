@@ -109,6 +109,19 @@ export class FileStore implements Store {
     });
   }
 
+  async deleteSchedule(id: string): Promise<void> {
+    await this.mutate((data) => {
+      // Postgres does this with cascades; here the same set is removed by hand.
+      // Houses and customers are shared across Saturdays and stay put, which is
+      // what the Postgres foreign keys do too.
+      data.schedules = data.schedules.filter((s) => s.id !== id);
+      data.jobs = data.jobs.filter((j) => j.scheduleId !== id);
+      data.routes = data.routes.filter((r) => r.scheduleId !== id);
+      data.assignments = data.assignments.filter((a) => a.scheduleId !== id);
+      data.overrides = data.overrides.filter((o) => o.scheduleId !== id);
+    });
+  }
+
   /* ------------------------------------------------------ Houses and customers */
 
   async getOrCreateHouse(input: {
@@ -276,6 +289,13 @@ export class FileStore implements Store {
     await this.mutate((data) => {
       const now = new Date().toISOString();
       data.overrides.push(...rows.map((row) => ({ ...row, id: newId("ovr"), createdAt: now })));
+    });
+  }
+
+  async clearScheduleHistory(scheduleId: string): Promise<void> {
+    await this.mutate((data) => {
+      data.assignments = data.assignments.filter((a) => a.scheduleId !== scheduleId);
+      data.overrides = data.overrides.filter((o) => o.scheduleId !== scheduleId);
     });
   }
 
