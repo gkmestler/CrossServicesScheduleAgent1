@@ -112,9 +112,11 @@ export type Schedule = {
   /**
    * The drive-time matrix from the last build, cached against the schedule so
    * drag-and-drop adjustments recompute times instantly and never re-call the
-   * distance API. `jobIds` gives the row/column order.
+   * distance API. `jobIds` gives the row/column order. `depotMinutes`, when
+   * present, gives each job's drive time from the home base in that same
+   * order — absent on schedules built before the home base existed.
    */
-  matrix: { jobIds: string[]; minutes: number[][] } | null;
+  matrix: { jobIds: string[]; minutes: number[][]; depotMinutes?: number[] } | null;
 };
 
 export type RouteStop = {

@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { Header } from "@/components/layout/Header";
 import { Board } from "@/components/screens/Board";
 import { getStore } from "@/lib/db";
+import { getHomeBaseCoordinate } from "@/lib/home-base";
 import { getScheduleDetail } from "@/lib/schedule";
 import { requireSession } from "@/lib/session";
 import type { BoardJob } from "@/components/screens/board-types";
@@ -15,6 +16,7 @@ export default async function BoardPage({ params }: { params: Promise<{ id: stri
   if (!detail) notFound();
 
   const store = getStore();
+  const homeBase = await getHomeBaseCoordinate();
 
   /**
    * The board never receives access codes. It has no use for them, and the
@@ -46,6 +48,7 @@ export default async function BoardPage({ params }: { params: Promise<{ id: stri
           jobs={jobs}
           routes={detail.routes}
           browserMapKey={process.env.NEXT_PUBLIC_GOOGLE_MAPS_BROWSER_KEY ?? null}
+          homeBase={homeBase}
         />
       </main>
     </>

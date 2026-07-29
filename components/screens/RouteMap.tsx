@@ -3,11 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { BoardJob } from "@/components/screens/board-types";
-import { Card } from "@/components/ui";
+import { Button, Card } from "@/components/ui";
 
 /**
  * Every stop, coloured by route, numbered in visiting order and joined by a line
- * that follows the run.
+ * that follows the run, with the home base every team works out of. Clicking a
+ * team in the legend isolates it.
  *
  * Uses a separate browser-restricted key (NEXT_PUBLIC_GOOGLE_MAPS_BROWSER_KEY),
  * distinct from the server key that does geocoding and distances. Without it the
@@ -90,16 +91,25 @@ export function RouteMap({
   apiKey,
   columns,
   estimated,
+  homeBase,
 }: {
   apiKey: string | null;
   columns: MapColumn[];
   estimated: boolean;
+  homeBase: { lat: number; lng: number } | null;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<Maps>(null);
   const overlaysRef = useRef<Maps[]>([]);
+  /** Which isolation the viewport was last fitted to; undefined until drawn. */
+  const fittedSelectionRef = useRef<number | null | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
+  const [selected, setSelected] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (selected !== null && selected >= columns.length) setSelected(null);
+  }, [columns.length, selected]);
 
   useEffect(() => {
     if (!apiKey) return;
@@ -117,9 +127,20 @@ export function RouteMap({
 
       if (cancelled || !containerRef.current) return;
 
-      const routes = layOut(columns);
+      // Laid out before the isolation filter, not after: colours come from a
+      // column's own index, and pins sharing a coordinate are spread against
+      // every other stop on the day. Filtering first would recolour the teams
+      // and shift the pins as soon as one was isolated.
+      const routes = layOut(columns).filter(
+        (_, index) => selected === null || index === selected,
+      );
+
       if (routes.every((route) => route.stops.length === 0)) {
-        setError("None of these jobs have coordinates yet.");
+        setError(
+          selected === null
+            ? "None of these jobs have coordinates yet."
+            : "This team has no jobs with coordinates yet.",
+        );
         return;
       }
       setError(null);
@@ -204,9 +225,45 @@ export function RouteMap({
         });
       }
 
-      // Only on the first draw: refitting after a drag would yank the viewport
-      // out from under someone who had zoomed into one corner of the map.
-      if (isFirstDraw) map.fitBounds(bounds, 48);
+      // Tracked as an overlay like everything else. Left untracked it would
+      // survive each redraw and stack a fresh H pin on top of the last one.
+      if (homeBase) {
+        const position = { lat: homeBase.lat, lng: homeBase.lng };
+        bounds.extend(position);
+        overlaysRef.current.push(
+          new maps.Marker({
+            map,
+            position,
+            title: "Home base — every team starts and ends the day here",
+            zIndex: 1000,
+            label: { text: "H", color: "#ffffff", fontSize: "11px", fontWeight: "700" },
+            icon: {
+              path: maps.SymbolPath.CIRCLE,
+              scale: 10,
+              fillColor: "#1a1a1a",
+              fillOpacity: 1,
+              strokeColor: "#ffffff",
+              strokeWeight: 2,
+            },
+          }),
+        );
+      }
+
+      // Refit on the first draw, and whenever a team is isolated or released —
+      // both change which area matters. Not on a drag or a rebuild, which would
+      // yank the viewport away from wherever someone had zoomed to.
+      if (isFirstDraw || fittedSelectionRef.current !== selected) {
+        fittedSelectionRef.current = selected;
+        if (isFirstDraw) {
+          // A map that was constructed a moment ago has not been laid out yet,
+          // so fitting now measures against the wrong size and leaves the stops
+          // pressed into the edges. The first idle is the map saying it knows
+          // how big it is.
+          maps.event.addListenerOnce(map, "idle", () => map.fitBounds(bounds, 48));
+        } else {
+          map.fitBounds(bounds, 48);
+        }
+      }
       setReady(true);
     }
 
@@ -214,7 +271,7 @@ export function RouteMap({
     return () => {
       cancelled = true;
     };
-  }, [apiKey, columns]);
+  }, [apiKey, columns, selected, homeBase]);
 
   if (!apiKey) {
     return (
@@ -231,17 +288,43 @@ export function RouteMap({
   return (
     <Card className="overflow-hidden">
       <div className="flex flex-wrap items-center gap-3 border-b border-line px-4 py-3">
-        {columns.map((column, index) => (
-          <span key={column.label + index} className="type-mono flex items-center gap-1.5 text-muted">
-            <span
-              aria-hidden="true"
-              className="inline-block h-3 w-3 rounded-full"
-              style={{ background: ROUTE_COLORS[index % ROUTE_COLORS.length] }}
-            />
-            {column.label}
-          </span>
-        ))}
-        <span className="type-mono ml-auto text-muted">Numbered in visiting order</span>
+        {columns.map((column, index) => {
+          const isSelected = selected === index;
+          return (
+            <button
+              key={column.label + index}
+              type="button"
+              aria-pressed={isSelected}
+              onClick={() => setSelected((current) => (current === index ? null : index))}
+              className={`type-mono flex items-center gap-1.5 rounded-[2px] px-1.5 py-0.5 ${
+                isSelected ? "bg-ink/8 text-ink" : "text-muted"
+              }`}
+            >
+              <span
+                aria-hidden="true"
+                className="inline-block h-3 w-3 rounded-full"
+                style={{ background: ROUTE_COLORS[index % ROUTE_COLORS.length] }}
+              />
+              {column.label}
+            </button>
+          );
+        })}
+
+        {selected !== null ? (
+          <Button variant="quiet" size="sm" onClick={() => setSelected(null)}>
+            Show all teams
+          </Button>
+        ) : null}
+
+        <span className="type-mono ml-auto flex flex-wrap items-center gap-x-3 gap-y-1 text-muted">
+          {homeBase ? (
+            <span className="flex items-center gap-1.5">
+              <span aria-hidden="true" className="inline-block h-3 w-3 rounded-full bg-[#1a1a1a]" />
+              Home base
+            </span>
+          ) : null}
+          <span>Numbered in visiting order</span>
+        </span>
       </div>
 
       {estimated ? (

@@ -84,6 +84,10 @@ async function handle(request: Request, { params }: { params: Promise<{ id: stri
     .map((jobId) => jobsById.get(jobId))
     .filter((job): job is NonNullable<typeof job> => job !== undefined);
 
+  const depotMinutes = cached.depotMinutes
+    ? new Map(cached.jobIds.map((jobId, i) => [jobId, cached.depotMinutes![i]]))
+    : undefined;
+
   const ctx = buildContext(
     orderedJobs.map((job) => ({
       id: job.id,
@@ -96,6 +100,7 @@ async function handle(request: Request, { params }: { params: Promise<{ id: stri
       durationMinutes: job.durationMinutes ?? DEFAULT_DURATION_MINUTES,
     })),
     cached.minutes,
+    depotMinutes,
   );
 
   const existing = await store.listRoutes(id);

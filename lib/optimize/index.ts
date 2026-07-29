@@ -42,6 +42,14 @@ export type OptimizerInput = {
   teamCount: number;
   /** Defaults to ceil(jobs / teams) + 1. */
   maxJobsPerTeam?: number;
+  /**
+   * Minutes from the home base to each job, keyed by job id. When set, every
+   * route is treated as a round trip from there — the leg out to the first
+   * stop and the leg back from the last are added to that route's drive total
+   * and factored into every optimization move, so a team's whole day (not
+   * just the driving between houses) decides its order. Omit for no home base.
+   */
+  depotMinutes?: Map<string, number>;
 };
 
 export type EvaluatedStop = {
@@ -60,8 +68,9 @@ export type EvaluatedStop = {
 export type RouteEvaluation = {
   stops: EvaluatedStop[];
   /**
-   * Real driving between these stops, in order. Not part of the arrival times —
-   * it is the cost the routing minimizes, and what the board reports separately.
+   * Real driving between these stops, in order, plus the home-base round trip
+   * when one is configured. Not part of the arrival times — it is the cost
+   * the routing minimizes, and what the board reports separately.
    */
   driveMinutes: number;
   /** Minutes past their window close, summed over every stop that runs over. */
@@ -98,16 +107,22 @@ export type EvalContext = {
   jobs: Map<string, OptimizerJob>;
   index: Map<string, number>;
   matrix: number[][];
+  /** See `OptimizerInput.depotMinutes`. */
+  depotMinutes?: Map<string, number>;
 };
 
-export function buildContext(jobs: OptimizerJob[], matrix: number[][]): EvalContext {
+export function buildContext(
+  jobs: OptimizerJob[],
+  matrix: number[][],
+  depotMinutes?: Map<string, number>,
+): EvalContext {
   const jobMap = new Map<string, OptimizerJob>();
   const index = new Map<string, number>();
   jobs.forEach((job, i) => {
     jobMap.set(job.id, job);
     index.set(job.id, i);
   });
-  return { jobs: jobMap, index, matrix };
+  return { jobs: jobMap, index, matrix, depotMinutes };
 }
 
 function travel(ctx: EvalContext, fromId: string, toId: string): number {
@@ -121,11 +136,16 @@ function travel(ctx: EvalContext, fromId: string, toId: string): number {
 /**
  * Walks an ordered list of job ids and computes arrival and finish times.
  *
- * A team has no depot — the day starts when they reach their first house, at
- * the moment that window opens. Every stop after it begins when the one before
- * it finishes: travel is measured and reported, but not spent (see the note at
- * the top of this file). A pinned job is arrived at exactly on its time,
- * waiting if necessary.
+ * The day starts when the team reaches their first house, at the moment that
+ * window opens — never later, even when a home base is configured. Every stop
+ * after it begins when the one before it finishes: travel is measured and
+ * reported, but not spent (see the note at the top of this file). A pinned job
+ * is arrived at exactly on its time, waiting if necessary.
+ *
+ * When `ctx.depotMinutes` is set, the round trip from the home base to the
+ * first stop and back from the last is added to the route's `driveMinutes`
+ * total — it is real driving the team does, and it is what the optimizer
+ * weighs when deciding a route's order — but it never shifts an arrival time.
  *
  * Running past a window close is never an error here — it is a violation on
  * that stop, which the board renders in place and the export sheet prints. This
@@ -185,6 +205,12 @@ export function evaluateRoute(order: string[], ctx: EvalContext): RouteEvaluatio
     // would be reported earlier than it can possibly happen.
     previousFinish = previousFinish === null ? finish : Math.max(finish, previousFinish);
     previousId = jobId;
+  }
+
+  if (ctx.depotMinutes && stops.length > 0) {
+    const outbound = ctx.depotMinutes.get(stops[0].jobId) ?? 0;
+    const inbound = ctx.depotMinutes.get(stops[stops.length - 1].jobId) ?? 0;
+    driveTotal += outbound + inbound;
   }
 
   return {
@@ -651,7 +677,7 @@ function attempt(
 
 export function optimize(input: OptimizerInput): OptimizerResult {
   const { jobs, matrix, teamCount } = input;
-  const ctx = buildContext(jobs, matrix);
+  const ctx = buildContext(jobs, matrix, input.depotMinutes);
 
   const unschedulable: { jobId: string; reason: string }[] = [];
   if (jobs.length === 0 || teamCount < 1) {

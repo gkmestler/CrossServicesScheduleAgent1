@@ -36,12 +36,14 @@ export function Board({
   jobs,
   routes: initialRoutes,
   browserMapKey,
+  homeBase,
 }: {
   scheduleId: string;
   schedule: Schedule;
   jobs: BoardJob[];
   routes: Route[];
   browserMapKey: string | null;
+  homeBase: { lat: number; lng: number } | null;
 }) {
   const jobsById = useMemo(() => new Map(jobs.map((job) => [job.id, job])), [jobs]);
 
@@ -52,6 +54,21 @@ export function Board({
   const [schedule, setSchedule] = useState<Schedule>(initialSchedule);
   const [columns, setColumns] = useState<Column[]>(() => toColumns(initialRoutes));
   const [tray, setTray] = useState<string[]>(() => toTray(initialRoutes, jobs));
+
+  // Columns are stored keyed by route, but always displayed in team order
+  // (1, 2, 3…) rather than whatever order the optimizer built them in.
+  const orderedColumns = useMemo(
+    () =>
+      columns
+        .map((column, index) => ({ column, index }))
+        .sort((a, b) => {
+          const rankA = a.column.finalTeam ?? a.column.suggestedTeam ?? Infinity;
+          const rankB = b.column.finalTeam ?? b.column.suggestedTeam ?? Infinity;
+          return rankA - rankB || a.index - b.index;
+        })
+        .map(({ column }) => column),
+    [columns],
+  );
 
   const [movedJobIds, setMovedJobIds] = useState<Set<string>>(new Set());
   const [teamCount, setTeamCount] = useState(schedule.teamCount);
@@ -68,6 +85,9 @@ export function Board({
     const ordered = schedule.matrix.jobIds
       .map((id) => jobsById.get(id))
       .filter((job): job is BoardJob => job !== undefined);
+    const depotMinutes = schedule.matrix.depotMinutes
+      ? new Map(schedule.matrix.jobIds.map((id, i) => [id, schedule.matrix!.depotMinutes![i]]))
+      : undefined;
     return buildContext(
       ordered.map((job) => ({
         id: job.id,
@@ -80,6 +100,7 @@ export function Board({
         durationMinutes: job.durationMinutes,
       })),
       schedule.matrix.minutes,
+      depotMinutes,
     );
   }, [schedule.matrix, jobsById]);
 
@@ -102,16 +123,19 @@ export function Board({
    * Memoized because the map redraws whenever this changes identity. Built
    * inline in the JSX it was a new array on every render, so every keystroke
    * elsewhere on the board tore down and rebuilt every pin and line.
+   *
+   * Ordered the same way as the board columns, so the colour a team has in the
+   * legend is the colour it has on the map and the two cannot drift apart.
    */
   const mapColumns = useMemo(
     () =>
-      columns.map((column, index) => ({
+      orderedColumns.map((column, index) => ({
         label: labelFor(column, index),
         jobs: column.jobIds
           .map((id) => jobsById.get(id))
           .filter((job): job is BoardJob => job !== undefined),
       })),
-    [columns, jobsById],
+    [orderedColumns, jobsById],
   );
 
   /* ------------------------------------------------------------------ saving */
@@ -398,6 +422,7 @@ export function Board({
         <div className="mt-6">
           <RouteMap
             apiKey={browserMapKey}
+            homeBase={homeBase}
             columns={mapColumns}
             estimated={schedule.distanceSource === "haversine"}
           />
@@ -437,7 +462,7 @@ export function Board({
                     {reason ? <p className="mt-1 max-w-[36ch] text-[15px] text-warn">{reason}</p> : null}
                     {!readOnly ? (
                       <MoveControl
-                        columns={columns}
+                        columns={orderedColumns}
                         currentRouteId={null}
                         onMove={(routeId) => applyMove(jobId, routeId, null)}
                       />
@@ -453,7 +478,7 @@ export function Board({
       {/* The board. Horizontally scrolling columns; on small screens each column
           is a swipeable, snapping card. */}
       <div className="hide-scrollbar mt-6 flex snap-x snap-mandatory gap-4 overflow-x-auto pb-4 md:snap-none">
-        {columns.map((column, index) => {
+        {orderedColumns.map((column, index) => {
           const evaluation = evaluations.get(column.routeId);
           const lateStops = evaluation?.stops.filter((stop) => stop.violation).length ?? 0;
           const isDropTarget = dropTarget === column.routeId;
@@ -601,7 +626,7 @@ export function Board({
                               ↓
                             </IconButton>
                             <MoveControl
-                              columns={columns}
+                              columns={orderedColumns}
                               currentRouteId={column.routeId}
                               onMove={(routeId) => applyMove(jobId, routeId, null)}
                             />
